@@ -496,6 +496,860 @@ function getDefensePairChemistry(p1, p2) {
   return 1.0;
 }
 
+// ============================================================
+// PHASE 9C-D — DAY-BY-DAY SEASON SIM & GAME RECAPS
+// ============================================================
+
+const SCHEDULE_CONFIG = {
+  totalGames: 82,
+  seasonStartMonth: 10, seasonStartDay: 8,
+  seasonEndMonth: 4,   seasonEndDay: 12,
+  teamsCount: 6,
+  maxConsecutiveHome: 4, maxConsecutiveAway: 4,
+  maxGamesPerWeek: 4,
+};
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const DAY_NAMES   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+// ---- Date utilities ----
+function makeDate(year, month1, day) {
+  // month1 is 1-based
+  return new Date(year, month1 - 1, day);
+}
+function dateToStr(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+function strToDate(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+function getNextDate(s) {
+  const d = strToDate(s);
+  d.setDate(d.getDate() + 1);
+  return dateToStr(d);
+}
+function addDays(s, n) {
+  const d = strToDate(s);
+  d.setDate(d.getDate() + n);
+  return dateToStr(d);
+}
+function daysBetween(s1, s2) {
+  const d1 = strToDate(s1), d2 = strToDate(s2);
+  return Math.round((d2 - d1) / 86400000);
+}
+function getDayOfWeek(s) {
+  return strToDate(s).getDay(); // 0=Sun
+}
+function formatDate(s) {
+  // "Oct 8" style
+  const d = strToDate(s);
+  return `${MONTH_NAMES[d.getMonth()]} ${d.getDate()}`;
+}
+function formatDateFull(s) {
+  const d = strToDate(s);
+  return `${DAY_NAMES[d.getDay()]}, ${MONTH_NAMES[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+function isSeasonOver(calendarDate, seasonEndDate) {
+  return calendarDate > seasonEndDate;
+}
+
+// ---- Schedule generator ----
+function generateMatchups() {
+  // 6 teams, 82 games each = 246 total games
+  // Each pair plays 16 or 17 games
+  const teams = TEAM_DEFS.map(t => t.id);
+  const pairs = [];
+  for (let i = 0; i < teams.length; i++) {
+    for (let j = i + 1; j < teams.length; j++) {
+      pairs.push([teams[i], teams[j]]);
+    }
+  }
+  // 15 pairs, 246 games → 246/15 = 16.4, so 6 pairs get 17 and 9 get 16
+  const matchups = [];
+  pairs.forEach((pair, idx) => {
+    const count = idx < 6 ? 17 : 16;
+    for (let g = 0; g < count; g++) {
+      // Alternate home/away evenly
+      const home = g % 2 === 0 ? pair[0] : pair[1];
+      const away = g % 2 === 0 ? pair[1] : pair[0];
+      matchups.push({ home, away });
+    }
+  });
+  return _.shuffle(matchups);
+}
+
+function generateSeasonSchedule(seasonNumber = 1) {
+  const baseYear = 2024 + seasonNumber;
+  const startStr = `${baseYear}-10-08`;
+  const endStr   = `${baseYear + 1}-04-12`;
+
+  // Build list of all dates in season
+  const allDates = [];
+  let cur = startStr;
+  while (cur <= endStr) {
+    allDates.push(cur);
+    cur = getNextDate(cur);
+  }
+
+  const matchups = generateMatchups(); // 246 matchups shuffled
+  const schedule = []; // { date, dayIndex, games[] }
+  const dateMap  = {}; // date → schedule entry index
+  const teamGameCounts = {}; // teamId → total games assigned
+  const teamWeekGames  = {}; // teamId → map of weekKey → count
+  const teamConsecHome = {}; // teamId → current consecutive home
+  const teamConsecAway = {}; // teamId → current consecutive away
+  const gamesPerDate   = {}; // date → count
+
+  TEAM_DEFS.forEach(t => {
+    teamGameCounts[t.id] = 0;
+    teamWeekGames[t.id]  = {};
+    teamConsecHome[t.id] = 0;
+    teamConsecAway[t.id] = 0;
+  });
+
+  // Pre-create schedule entries for all dates
+  allDates.forEach((date, idx) => {
+    schedule.push({ date, dayIndex: idx, games: [] });
+    dateMap[date] = idx;
+    gamesPerDate[date] = 0;
+  });
+
+  function getWeekKey(date) {
+    const d = strToDate(date);
+    // ISO week approximation: year + week number
+    const jan1 = new Date(d.getFullYear(), 0, 1);
+    const week = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+    return `${d.getFullYear()}-W${week}`;
+  }
+
+  function canAssign(date, home, away) {
+    // Max 3 games per date slot
+    if (gamesPerDate[date] >= 3) return false;
+    // Max 4 per week per team
+    const wk = getWeekKey(date);
+    if ((teamWeekGames[home][wk] || 0) >= 4) return false;
+    if ((teamWeekGames[away][wk] || 0) >= 4) return false;
+    // Consecutive home/away limit
+    if (teamConsecHome[home] >= 4) return false;
+    if (teamConsecAway[away] >= 4) return false;
+    return true;
+  }
+
+  // Greedy assignment: try each matchup on the earliest valid date
+  let dateIdx = 0;
+  for (const mu of matchups) {
+    let assigned = false;
+    for (let di = dateIdx; di < allDates.length; di++) {
+      const date = allDates[di];
+      if (canAssign(date, mu.home, mu.away)) {
+        const gameId = `game_${schedule[dateMap[date]].games.length + 1}_${date.replace(/-/g,'')}`;
+        schedule[dateMap[date]].games.push({
+          id: `${date}_${mu.home}_${mu.away}`,
+          homeTeamId: mu.home, awayTeamId: mu.away,
+          date, status: 'scheduled', result: null,
+          isUserGame: mu.home === USER_TEAM_ID || mu.away === USER_TEAM_ID,
+        });
+        gamesPerDate[date]++;
+        // Update team tracking
+        const wk = getWeekKey(date);
+        teamWeekGames[mu.home][wk] = (teamWeekGames[mu.home][wk] || 0) + 1;
+        teamWeekGames[mu.away][wk] = (teamWeekGames[mu.away][wk] || 0) + 1;
+        teamGameCounts[mu.home]++;
+        teamGameCounts[mu.away]++;
+        // Update consecutive streaks (simplified: just track within assigned)
+        teamConsecHome[mu.home]++;
+        teamConsecAway[mu.home] = 0;
+        teamConsecAway[mu.away]++;
+        teamConsecHome[mu.away] = 0;
+        assigned = true;
+        break;
+      }
+    }
+    if (!assigned) {
+      // Force-assign to first date that has room
+      for (let di = 0; di < allDates.length; di++) {
+        const date = allDates[di];
+        if (gamesPerDate[date] < 3) {
+          schedule[dateMap[date]].games.push({
+            id: `${date}_${mu.home}_${mu.away}`,
+            homeTeamId: mu.home, awayTeamId: mu.away,
+            date, status: 'scheduled', result: null,
+            isUserGame: mu.home === USER_TEAM_ID || mu.away === USER_TEAM_ID,
+          });
+          gamesPerDate[date]++;
+          const wk = getWeekKey(date);
+          teamWeekGames[mu.home][wk] = (teamWeekGames[mu.home][wk] || 0) + 1;
+          teamWeekGames[mu.away][wk] = (teamWeekGames[mu.away][wk] || 0) + 1;
+          break;
+        }
+      }
+    }
+  }
+
+  // Build teamSchedules index
+  const teamSchedules = {};
+  TEAM_DEFS.forEach(t => { teamSchedules[t.id] = []; });
+  schedule.forEach(day => {
+    day.games.forEach(g => {
+      teamSchedules[g.homeTeamId].push(g.id);
+      teamSchedules[g.awayTeamId].push(g.id);
+    });
+  });
+
+  // Remove empty days from schedule
+  const filteredSchedule = schedule.filter(d => d.games.length > 0);
+
+  return { schedule: filteredSchedule, teamSchedules, startStr, endStr };
+}
+
+function initSeasonCalendar(seasonNumber = 1) {
+  const { schedule, teamSchedules, startStr, endStr } = generateSeasonSchedule(seasonNumber);
+  return {
+    currentDate: startStr,
+    seasonStartDate: startStr,
+    seasonEndDate: endStr,
+    currentDayIndex: 0,
+    schedule,
+    teamSchedules,
+    advanceMode: 'day',
+    completedDays: 0,
+    totalGameDays: schedule.length,
+  };
+}
+
+// ---- Game tag analysis ----
+function analyzeGameTags(result, homeTeamId, awayTeamId) {
+  const tags = new Set();
+  const homeScore = result.homeScore || 0;
+  const awayScore = result.awayScore || 0;
+  const shootout  = result.isSO || false;
+  const overtimes = result.isOT ? 1 : 0;
+  const events    = result.scoringEvents || [];
+  const scoreDiff = Math.abs(homeScore - awayScore);
+  const totalGoals = homeScore + awayScore;
+  const winner = homeScore > awayScore ? homeTeamId : awayTeamId;
+  const loser  = homeScore > awayScore ? awayTeamId : homeTeamId;
+
+  // Basic outcome tags
+  if (homeScore === 0 || awayScore === 0) tags.add('shutout');
+  if (scoreDiff >= 4) tags.add('blowout');
+  if (scoreDiff === 1 && !shootout) tags.add('one_goal_game');
+  if (totalGoals >= 8) tags.add('high_scoring');
+  if (totalGoals <= 3) tags.add('low_scoring');
+  if (overtimes > 0 && !shootout) tags.add('overtime_thriller');
+  if (shootout) tags.add('shootout_finish');
+
+  // Game flow tags (from events)
+  if (events && events.length) {
+    // scoringEvents format: { team:'home'|'away', strength, scorerId, assist1Id, assist2Id, time }
+    // team is 'home'|'away' — map to teamIds
+    const maxDeficit = { [homeTeamId]: 0, [awayTeamId]: 0 };
+    let hScore = 0, aScore = 0;
+    for (const ev of events) {
+      const evTeamId = ev.team === 'home' ? homeTeamId : awayTeamId;
+      if (evTeamId === homeTeamId) hScore++;
+      else aScore++;
+      maxDeficit[homeTeamId] = Math.max(maxDeficit[homeTeamId], aScore - hScore);
+      maxDeficit[awayTeamId] = Math.max(maxDeficit[awayTeamId], hScore - aScore);
+    }
+    if (maxDeficit[winner] >= 2) tags.add('comeback');
+    if (maxDeficit[loser] >= 2 && scoreDiff >= 1) tags.add('collapse');
+
+    // Hat trick / multi-point
+    const scorerCounts = {};
+    const assistCounts = {};
+    for (const ev of events) {
+      if (ev.scorerId) scorerCounts[ev.scorerId] = (scorerCounts[ev.scorerId] || 0) + 1;
+      if (ev.assist1Id) assistCounts[ev.assist1Id] = (assistCounts[ev.assist1Id] || 0) + 1;
+      if (ev.assist2Id) assistCounts[ev.assist2Id] = (assistCounts[ev.assist2Id] || 0) + 1;
+    }
+    const maxGoals = Math.max(0, ...Object.values(scorerCounts));
+    if (maxGoals >= 3) tags.add('hat_trick');
+    else if (maxGoals === 2) tags.add('near_hat_trick');
+
+    // Check multi-point (3+ points in game)
+    const pointTotals = {};
+    for (const [pid, g] of Object.entries(scorerCounts)) {
+      pointTotals[pid] = (pointTotals[pid] || 0) + g;
+    }
+    for (const [pid, a] of Object.entries(assistCounts)) {
+      pointTotals[pid] = (pointTotals[pid] || 0) + a;
+    }
+    if (Math.max(0, ...Object.values(pointTotals)) >= 3) tags.add('multi_point');
+
+    // Power play clinic: 3+ PP goals by one team
+    const ppGoals = events.filter(e => e.strength === 'PP');
+    const ppByTeam = {};
+    ppGoals.forEach(e => {
+      const tid = e.team === 'home' ? homeTeamId : awayTeamId;
+      ppByTeam[tid] = (ppByTeam[tid] || 0) + 1;
+    });
+    if (Math.max(0, ...Object.values(ppByTeam)) >= 3) tags.add('power_play_clinic');
+  }
+
+  // Score swing tags
+  if (scoreDiff === 0) tags.add('back_and_forth'); // shouldn't reach final with 0 diff but just in case
+  else if (scoreDiff >= 2 && scoreDiff <= 3 && totalGoals >= 6) tags.add('back_and_forth');
+
+  // Goalie performance
+  if (tags.has('shutout')) tags.add('goalie_shutout');
+  else if ((homeScore <= 1 || awayScore <= 1) && !tags.has('shutout')) tags.add('goalie_stood_tall');
+
+  return [...tags];
+}
+
+const STORYLINE_PRIORITY = [
+  'hat_trick','goalie_shutout','comeback','milestone',
+  'overtime_thriller','shootout_finish','one_goal_game',
+  'blowout','high_scoring','power_play_clinic',
+  'near_hat_trick','multi_point','low_scoring','back_and_forth',
+  'collapse','penalty_fest','physical_war','shutout',
+];
+
+function selectPrimaryStoryline(tags) {
+  for (const sl of STORYLINE_PRIORITY) {
+    if (tags.includes(sl)) return sl;
+  }
+  return tags[0] || 'wire_to_wire';
+}
+
+// ---- Headline generator ----
+const HEADLINE_TEMPLATES = {
+  hat_trick:         (d) => [`${d.scorer} Nets Hat Trick as ${d.winner} ${d.verb} ${d.loser}`, `${d.scorer} Delivers Three-Goal Performance in ${d.score} ${d.winner} Win`],
+  goalie_shutout:    (d) => [`${d.goalie} Stops All ${d.shots} Shots in ${d.winner}'s ${d.score} Shutout Win`, `Blanked! ${d.goalie} Shuts the Door on ${d.loser}`],
+  comeback:          (d) => [`${d.winner} Rallies from ${d.deficitStr} Down to Stun ${d.loser} ${d.score}`, `Comeback Kings: ${d.winner} Erases ${d.deficitStr} Deficit`],
+  milestone:         (d) => [`${d.milestonePlayer} Reaches ${d.milestoneNum} ${d.milestoneType} in ${d.winner}'s Win`, `Milestone Moment: ${d.milestonePlayer} Hits ${d.milestoneNum}`],
+  overtime_thriller: (d) => [`${d.scorer} Ends it in OT! ${d.winner} Tops ${d.loser} ${d.score}`, `${d.winner} Survives ${d.otPeriods}OT Marathon to Edge ${d.loser}`],
+  shootout_finish:   (d) => [`${d.winner} Edges ${d.loser} in Shootout`, `It Comes Down to a Shootout — ${d.winner} Prevails`],
+  one_goal_game:     (d) => [`${d.winner} Holds Off ${d.loser} in Tight ${d.score} Contest`, `Thriller in the Final Minutes: ${d.winner} Takes Two Points`],
+  blowout:           (d) => [`${d.winner} Runs Away from ${d.loser} in ${d.score} Rout`, `Dominant ${d.winner} Overwhelms ${d.loser}`],
+  high_scoring:      (d) => [`Goalfest! ${d.winner} and ${d.loser} Combine for ${d.totalGoals} Goals`, `${d.winner} Wins Wild ${d.score} Affair`],
+  power_play_clinic: (d) => [`${d.winner}'s Power Play Leads the Way in ${d.score} Victory`, `Special Teams Make the Difference for ${d.winner}`],
+  low_scoring:       (d) => [`${d.winner} Grinds Out ${d.score} Win Over ${d.loser}`, `Defense Dominates as ${d.winner} Takes ${d.score} Decision`],
+  physical_war:      (d) => [`Hard-Fought Battle: ${d.winner} Wins Physical ${d.score} Tilt`, `${d.winner} Weathers Storm to Beat ${d.loser}`],
+  back_and_forth:    (d) => [`Lead Changes Galore: ${d.winner} Claims ${d.score} in Back-and-Forth Affair`, `Neither Team Quits — ${d.winner} Prevails ${d.score}`],
+  collapse:          (d) => [`${d.loser} Blows Late Lead, ${d.winner} Completes ${d.score} Comeback`, `${d.loser} Can't Hold On — ${d.winner} Steals Two Points`],
+  wire_to_wire:      (d) => [`${d.winner} Controls ${d.score} Win Over ${d.loser}`, `${d.winner} Never Looks Back in ${d.score} Decision`],
+};
+
+function buildHeadlineData(result, teams, tags, storyline) {
+  const ht = teams.find(t => t.id === result.homeTeamId);
+  const at = teams.find(t => t.id === result.awayTeamId);
+  const homeWon = result.homeScore > result.awayScore;
+  const winner = homeWon ? ht : at;
+  const loser  = homeWon ? at : ht;
+  const score  = homeWon
+    ? `${result.homeScore}-${result.awayScore}`
+    : `${result.awayScore}-${result.homeScore}`;
+
+  // Find top scorer
+  let scorer = 'Unknown', scorerGoals = 0;
+  let goalie = 'Unknown', shots = 0;
+  const playerStats2 = result.playerStats || result.playerGameStats || {};
+  const allPlayersForHL = teams ? teams.flatMap(t => t.players) : [];
+  const playerMapHL = {};
+  allPlayersForHL.forEach(p => { playerMapHL[p.id] = p; });
+  const homeSet2 = new Set(teams ? (teams.find(t => t.id === result.homeTeamId)?.players || []).map(p => p.id) : []);
+  const awaySet2 = new Set(teams ? (teams.find(t => t.id === result.awayTeamId)?.players || []).map(p => p.id) : []);
+  for (const [pid, st] of Object.entries(playerStats2)) {
+    const g = st.G || 0;
+    if (g > scorerGoals) {
+      scorerGoals = g;
+      const pl = playerMapHL[pid];
+      scorer = pl ? `${pl.firstName} ${pl.lastName}` : pid;
+    }
+  }
+  for (const [pid, st] of Object.entries(playerStats2)) {
+    const pl = playerMapHL[pid];
+    const isG = pl ? pl.position === 'G' : (st.SV !== undefined);
+    const plTeamId = homeSet2.has(pid) ? result.homeTeamId : awaySet2.has(pid) ? result.awayTeamId : null;
+    if (isG && plTeamId === winner?.id) {
+      const plObj = playerMapHL[pid];
+      goalie = plObj ? `${plObj.firstName} ${plObj.lastName}` : pid;
+      shots = st.SA || 0;
+    }
+  }
+
+  // Deficit for comeback
+  let maxDeficit = 2;
+  if (result.scoringEvents) {
+    let h = 0, a = 0;
+    for (const ev of result.scoringEvents) {
+      if (ev.team === 'home') h++; else a++;
+      if (homeWon) maxDeficit = Math.max(maxDeficit, a - h);
+      else maxDeficit = Math.max(maxDeficit, h - a);
+    }
+  }
+  const deficitStr = `${maxDeficit}-Goal`;
+
+  const winVerbs = ['Defeats','Edges','Tops','Downs','Beats','Blanks'];
+  const verb = winVerbs[Math.floor(Math.random() * winVerbs.length)];
+
+  return {
+    winner: winner?.name || 'Home', loser: loser?.name || 'Away',
+    winnerAbbr: winner?.abbr || 'HOM', loserAbbr: loser?.abbr || 'AWY',
+    score, totalGoals: result.homeScore + result.awayScore,
+    scorer, goalie, shots, deficitStr, verb,
+    otPeriods: result.overtimes || 1,
+  };
+}
+
+function generateHeadline(result, teams, tags, storyline) {
+  const d = buildHeadlineData(result, teams, tags, storyline);
+  const templates = HEADLINE_TEMPLATES[storyline] || HEADLINE_TEMPLATES.wire_to_wire;
+  const options = templates(d);
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+// ---- Body paragraph generator ----
+function generateRecapBody(result, teams, tags, storyline) {
+  const ht = teams.find(t => t.id === result.homeTeamId);
+  const at = teams.find(t => t.id === result.awayTeamId);
+  const homeWon = result.homeScore > result.awayScore;
+  const winner = homeWon ? ht : at;
+  const loser  = homeWon ? at : ht;
+  const score  = `${Math.max(result.homeScore, result.awayScore)}-${Math.min(result.homeScore, result.awayScore)}`;
+  const venue  = `${ht?.city || ht?.name || 'home'} arena`;
+
+  // Find top performers
+  let topScorer = null, topAssister = null, winGoalie = null;
+  const playerStatsBody = result.playerStats || result.playerGameStats || {};
+  const allPlayersBody = teams ? teams.flatMap(t => t.players) : [];
+  const playerMapBody = {};
+  allPlayersBody.forEach(p => { playerMapBody[p.id] = p; });
+  const homeSetBody = new Set(teams ? (teams.find(t => t.id === result.homeTeamId)?.players || []).map(p => p.id) : []);
+  const awaySetBody = new Set(teams ? (teams.find(t => t.id === result.awayTeamId)?.players || []).map(p => p.id) : []);
+
+  let maxPts = 0, maxAst = 0;
+  for (const [pid, st] of Object.entries(playerStatsBody)) {
+    const pl = playerMapBody[pid];
+    const isG = pl ? pl.position === 'G' : (st.SV !== undefined);
+    const plTeamId = homeSetBody.has(pid) ? result.homeTeamId : awaySetBody.has(pid) ? result.awayTeamId : null;
+    if (!isG) {
+      const g = st.G || 0, a = st.A || 0;
+      const pts = g + a;
+      if (pts > maxPts) {
+        maxPts = pts;
+        const name = pl ? `${pl.firstName} ${pl.lastName}` : pid;
+        topScorer = { goals: g, assists: a, name, team: plTeamId, pid };
+      }
+      if (a > maxAst) { maxAst = a; }
+    } else if (plTeamId === winner?.id) {
+      const sv = st.SV || 0, sa = st.SA || 0;
+      const name = pl ? `${pl.firstName} ${pl.lastName}` : pid;
+      winGoalie = { saves: sv, shotsAgainst: sa, name, team: plTeamId, pid };
+    }
+  }
+
+  const openings = [
+    `${winner?.name || 'The home team'} made a statement on ${formatDate(result.date)} at ${venue}, securing a ${score} victory over ${loser?.name}.`,
+    `It was a night to remember in ${ht?.city || 'the city'} as ${winner?.name} claimed a ${score} triumph against ${loser?.name}.`,
+    `${loser?.name} came to ${venue} looking for two points, but ${winner?.name} had other ideas — finishing with a convincing ${score} victory.`,
+  ];
+
+  const keyMoments = [];
+  if (tags.includes('comeback')) keyMoments.push(`${winner?.name} showed tremendous resilience, erasing a multi-goal deficit to steal the win.`);
+  if (tags.includes('overtime_thriller')) keyMoments.push(`Regulation couldn't settle it, sending the crowd on edge through ${result.overtimes || 1} overtime period(s) before the final horn.`);
+  if (tags.includes('shootout_finish')) keyMoments.push(`The teams needed a shootout to separate themselves, with ${winner?.name} converting the deciding attempt.`);
+  if (tags.includes('blowout')) keyMoments.push(`There was no doubt as to who the better team was tonight — ${winner?.name} pulled away early and never looked back.`);
+  if (tags.includes('power_play_clinic')) keyMoments.push(`The power play was the difference, with ${winner?.name}'s special teams clicking at a high rate on the man advantage.`);
+  if (keyMoments.length === 0) keyMoments.push(`${winner?.name} controlled key stretches of the game to secure the important two points.`);
+
+  const starLines = [];
+  if (topScorer && ((topScorer.goals || 0) + (topScorer.assists || 0)) >= 2) {
+    const g = topScorer.goals || 0, a = topScorer.assists || 0;
+    const pts = g + a;
+    starLines.push(`${topScorer.name || 'A top forward'} paced ${winner?.name} offensively with ${g > 0 ? g + ' goal' + (g > 1 ? 's' : '') : ''} ${a > 0 ? 'and ' + a + ' assist' + (a > 1 ? 's' : '') : ''} for a ${pts}-point outing.`);
+  }
+  if (winGoalie && (winGoalie.saves || 0) >= 25) {
+    starLines.push(`In goal, ${winGoalie.name || 'the netminder'} was outstanding — stopping ${winGoalie.saves} of ${winGoalie.shotsAgainst} shots to backstop the victory.`);
+  }
+
+  const closers = [
+    `With the win, ${winner?.name} continues to build momentum heading into the rest of the schedule.`,
+    `Both teams get right back at it as the busy season calendar rolls on.`,
+    `${winner?.name} improves their record while ${loser?.name} will look to bounce back in their next outing.`,
+  ];
+
+  const paragraphs = [
+    openings[Math.floor(Math.random() * openings.length)],
+    keyMoments[0],
+    ...starLines.slice(0, 1),
+    closers[Math.floor(Math.random() * closers.length)],
+  ].filter(Boolean);
+
+  return paragraphs;
+}
+
+function generateGameRecap(result, teams, tags, storyline) {
+  const headline = generateHeadline(result, teams, tags, storyline);
+  const subheadline = generateHeadline(result, teams, tags,
+    tags.find(t => t !== storyline) || storyline);
+  const body = generateRecapBody(result, teams, tags, storyline);
+  const stars = selectThreeStars(result, teams);
+  return { headline, subheadline, body, stars, tags, storyline };
+}
+
+// ---- Three stars selection ----
+function selectThreeStars(result, teams) {
+  if (!result) return [];
+  const playerStats = result.playerStats || result.playerGameStats || {};
+  if (!Object.keys(playerStats).length) return [];
+
+  // Build a pid → player name lookup from teams
+  const allPlayers = teams ? teams.flatMap(t => t.players) : [];
+  const playerMap = {};
+  allPlayers.forEach(p => { playerMap[p.id] = p; });
+
+  // Determine which team each player belongs to
+  const homeSet = new Set((result.homeTeamId && teams)
+    ? (teams.find(t => t.id === result.homeTeamId)?.players || []).map(p => p.id) : []);
+  const awaySet = new Set((result.awayTeamId && teams)
+    ? (teams.find(t => t.id === result.awayTeamId)?.players || []).map(p => p.id) : []);
+
+  const candidates = [];
+  for (const [pid, st] of Object.entries(playerStats)) {
+    const player = playerMap[pid];
+    const isGoalie = player ? player.position === 'G' : (st.SV !== undefined || st.GA !== undefined);
+    const teamId = homeSet.has(pid) ? result.homeTeamId : awaySet.has(pid) ? result.awayTeamId : null;
+    let starScore = 0;
+    if (!isGoalie) {
+      const g = st.G || 0, a = st.A || 0;
+      starScore += g * 3 + a * 1.5;
+      if (g >= 3) starScore += 4;
+    } else {
+      const sv = st.SV || 0, sa = st.SA || 0, ga = st.GA || 0;
+      const svPct = sa > 0 ? sv / sa : 0;
+      starScore = svPct * 5 + sv * 0.1;
+      if (sa > 0 && ga === 0) starScore += 5;
+    }
+    if (starScore <= 0) continue;
+    candidates.push({
+      pid,
+      name: player ? `${player.firstName} ${player.lastName}` : pid,
+      team: teamId,
+      starScore,
+      isGoalie,
+      goals: st.G || 0, assists: st.A || 0,
+      saves: st.SV || 0, shotsAgainst: st.SA || 0, goalsAgainst: st.GA || 0,
+    });
+  }
+  candidates.sort((a, b) => b.starScore - a.starScore);
+  return candidates.slice(0, 3);
+}
+
+// ---- Storyline tracker ----
+function initStorylineTracker() {
+  return {
+    streaks: {}, // teamId → { type: 'win'|'loss'|'otl', count }
+    playerStreaks: {}, // playerId → { goalStreak, pointStreak, assistStreak }
+    milestones: [],   // { playerId, name, type, current, target, label }
+    recentRecaps: [], // last 20 game recaps
+    aroundTheLeague: [], // feed items
+  };
+}
+
+function updateStorylineTracker(tracker, dayResults, teams) {
+  const newTracker = {
+    ...tracker,
+    streaks: { ...tracker.streaks },
+    playerStreaks: { ...tracker.playerStreaks },
+    milestones: [...tracker.milestones],
+    recentRecaps: [...tracker.recentRecaps],
+    aroundTheLeague: [],
+  };
+
+  const feed = [];
+
+  for (const gr of dayResults) {
+    const { result } = gr;
+    if (!result) continue;
+
+    const homeWon = result.homeScore > result.awayScore;
+    const winnerId = homeWon ? result.homeTeamId : result.awayTeamId;
+    const loserId  = homeWon ? result.awayTeamId : result.homeTeamId;
+    const wasOT    = result.isOT || result.isSO || result.overtimes > 0 || result.shootout || false;
+
+    // Team streaks
+    for (const teamId of [winnerId, loserId]) {
+      const prev = newTracker.streaks[teamId] || { type: 'win', count: 0 };
+      if (teamId === winnerId) {
+        if (prev.type === 'win') newTracker.streaks[teamId] = { type: 'win', count: prev.count + 1 };
+        else newTracker.streaks[teamId] = { type: 'win', count: 1 };
+      } else {
+        const lossType = wasOT ? 'otl' : 'loss';
+        if (prev.type === lossType || (lossType === 'otl' && prev.type === 'loss')) {
+          newTracker.streaks[teamId] = { type: lossType, count: prev.count + 1 };
+        } else {
+          newTracker.streaks[teamId] = { type: lossType, count: 1 };
+        }
+      }
+    }
+
+    // Player streaks & milestones
+    const allTeamPlayers = teams ? teams.flatMap(t => t.players) : [];
+    if (result.playerStats) {
+      for (const [pid, st] of Object.entries(result.playerStats)) {
+        const plrObj = allTeamPlayers.find(p => p.id === pid);
+        if (plrObj && plrObj.position === 'G') continue;
+        // Skip if looks like a goalie stat (has GA but no G field with goals scored)
+        if (!plrObj && st.GA !== undefined && st.G === undefined) continue;
+        const prev = newTracker.playerStreaks[pid] || { goalStreak: 0, pointStreak: 0, assistStreak: 0 };
+        const hasGoal   = (st.G   || st.goals   || 0) > 0;
+        const hasPoint  = (st.G   || st.goals   || 0) + (st.A || st.assists || 0) > 0;
+        const hasAssist = (st.A   || st.assists  || 0) > 0;
+        newTracker.playerStreaks[pid] = {
+          goalStreak:   hasGoal   ? prev.goalStreak   + 1 : 0,
+          pointStreak:  hasPoint  ? prev.pointStreak  + 1 : 0,
+          assistStreak: hasAssist ? prev.assistStreak + 1 : 0,
+        };
+      }
+    }
+
+    // Add feed items for notable events
+    const winTeam = teams.find(t => t.id === winnerId);
+    const loseTeam = teams.find(t => t.id === loserId);
+    if (result.tags && result.tags.includes('hat_trick')) {
+      const hatter = result.stars && result.stars[0];
+      feed.push({ type: 'hat_trick', icon: '🎩', text: `${hatter?.name || 'A player'} scored a hat trick as ${winTeam?.name || winnerId} beat ${loseTeam?.name || loserId} ${result.homeScore}-${result.awayScore}` });
+    }
+    if (result.tags && result.tags.includes('goalie_shutout')) {
+      const g = result.stars && result.stars.find(s => s.isGoalie);
+      feed.push({ type: 'shutout', icon: '🧱', text: `${g?.name || 'Goalie'} recorded a shutout for ${winTeam?.name || winnerId}` });
+    }
+    if (result.tags && result.tags.includes('comeback')) {
+      feed.push({ type: 'comeback', icon: '⚡', text: `${winTeam?.name || winnerId} rallied for a comeback victory over ${loseTeam?.name || loserId}` });
+    }
+    if (result.tags && result.tags.includes('overtime_thriller')) {
+      feed.push({ type: 'ot', icon: '⏱️', text: `${winTeam?.name || winnerId} and ${loseTeam?.name || loserId} needed overtime — ${winTeam?.name || winnerId} wins ${result.homeScore}-${result.awayScore}` });
+    }
+  }
+
+  // Win streak alerts
+  for (const [teamId, streak] of Object.entries(newTracker.streaks)) {
+    if (streak.type === 'win' && streak.count >= 5) {
+      const team = teams.find(t => t.id === teamId);
+      feed.push({ type: 'streak', icon: '🔥', text: `${team?.name || teamId} extends their winning streak to ${streak.count} games!` });
+    }
+    if ((streak.type === 'loss' || streak.type === 'otl') && streak.count >= 5) {
+      const team = teams.find(t => t.id === teamId);
+      feed.push({ type: 'cold', icon: '❄️', text: `${team?.name || teamId} has lost ${streak.count} straight and is struggling.` });
+    }
+  }
+
+  newTracker.aroundTheLeague = feed.slice(0, 10);
+  newTracker.recentRecaps = [...newTracker.recentRecaps, ...dayResults.filter(r => r.recap).map(r => r.recap)].slice(-30);
+
+  return newTracker;
+}
+
+// ---- advanceDay engine ----
+function advanceDay(leagueState, setLeagueState) {
+  setLeagueState(prev => {
+    if (!prev.seasonCalendar) return prev;
+    const cal = prev.seasonCalendar;
+    const { schedule, currentDate, seasonEndDate } = cal;
+
+    if (currentDate > seasonEndDate) return prev;
+
+    // Find today's schedule entry
+    const todayEntry = schedule.find(d => d.date === currentDate);
+    if (!todayEntry) {
+      // Advance to next date
+      return {
+        ...prev,
+        seasonCalendar: { ...cal, currentDate: getNextDate(currentDate), currentDayIndex: cal.currentDayIndex + 1 },
+      };
+    }
+
+    // Simulate all games for today
+    let teams = prev.teams.map(t => ({ ...t }));
+    const dayResults = [];
+
+    for (const gameSlot of todayEntry.games) {
+      if (gameSlot.status === 'completed') continue;
+      const homeTeam = teams.find(t => t.id === gameSlot.homeTeamId);
+      const awayTeam = teams.find(t => t.id === gameSlot.awayTeamId);
+      if (!homeTeam || !awayTeam) continue;
+
+      const result = simulateGame(homeTeam, awayTeam);
+      // Tag analysis
+      // Normalize result fields for Phase 9C-D compatibility
+      result.scoringEvents = result.scoringEvents || [];
+      result.overtimes = result.isOT ? 1 : 0;
+      result.shootout   = result.isSO || false;
+      result.homeShots  = result.gameStats?.home?.shots || 0;
+      result.awayShots  = result.gameStats?.away?.shots || 0;
+      result.homePPG    = result.gameStats?.home?.ppg || 0;
+      result.awayPPG    = result.gameStats?.away?.ppg || 0;
+      result.homePPO    = result.gameStats?.home?.ppo || 0;
+      result.awayPPO    = result.gameStats?.away?.ppo || 0;
+      result.playerStats = result.playerGameStats || {};
+
+      const tags = analyzeGameTags(result, gameSlot.homeTeamId, gameSlot.awayTeamId);
+      result.tags = tags;
+      const storyline = selectPrimaryStoryline(tags);
+      result.storyline = storyline;
+      result.date = gameSlot.date;
+      result.homeTeamId = gameSlot.homeTeamId;
+      result.awayTeamId = gameSlot.awayTeamId;
+
+      // Generate recap
+      const recap = generateGameRecap(result, teams, tags, storyline);
+      result.recap = recap;
+      result.stars = recap.stars;
+
+      // Update team season stats
+      const homeWon = result.homeScore > result.awayScore;
+      const wasOT   = result.isOT || result.isSO || false;
+      teams = teams.map(t => {
+        if (t.id === gameSlot.homeTeamId) {
+          const ss = { ...t.seasonStats };
+          ss.GP++;
+          ss.GF += result.homeScore; ss.GA += result.awayScore;
+          ss.SF += result.homeShots || 0; ss.SA += result.awayShots || 0;
+          ss.PPG  = (ss.PPG  || 0) + (result.homePPG || 0);
+          ss.PPO  = (ss.PPO  || 0) + (result.homePPO || 0);
+          ss.PKG_against = (ss.PKG_against || 0) + (result.awayPPG || 0);
+          ss.PKO  = (ss.PKO  || 0) + (result.awayPPO || 0);
+          if (homeWon) ss.W++;
+          else if (wasOT) ss.OTL++;
+          else ss.L++;
+          return { ...t, seasonStats: ss };
+        }
+        if (t.id === gameSlot.awayTeamId) {
+          const ss = { ...t.seasonStats };
+          ss.GP++;
+          ss.GF += result.awayScore; ss.GA += result.homeScore;
+          ss.SF += result.awayShots || 0; ss.SA += result.homeShots || 0;
+          ss.PPG  = (ss.PPG  || 0) + (result.awayPPG || 0);
+          ss.PPO  = (ss.PPO  || 0) + (result.awayPPO || 0);
+          ss.PKG_against = (ss.PKG_against || 0) + (result.homePPG || 0);
+          ss.PKO  = (ss.PKO  || 0) + (result.homePPO || 0);
+          if (!homeWon) ss.W++;
+          else if (wasOT) ss.OTL++;
+          else ss.L++;
+          return { ...t, seasonStats: ss };
+        }
+        return t;
+      });
+
+      // Update player stats from result (playerGameStats uses uppercase keys: G,A,SV,SA,GA,SO)
+      if (result.playerStats) {
+        teams = teams.map(team => {
+          if (team.id !== gameSlot.homeTeamId && team.id !== gameSlot.awayTeamId) return team;
+          return {
+            ...team,
+            players: team.players.map(p => {
+              const ps = result.playerStats[p.id];
+              if (!ps) return p;
+              const ss = { ...p.seasonStats };
+              if (p.position === 'G') {
+                ss.GP  = (ss.GP  || 0) + 1;
+                ss.W   = (ss.W   || 0) + (ps.W  || 0);
+                ss.L   = (ss.L   || 0) + (ps.L  || 0);
+                ss.OTL = (ss.OTL || 0) + (ps.OTL|| 0);
+                ss.GA  = (ss.GA  || 0) + (ps.GA || 0);
+                ss.SV  = (ss.SV  || 0) + (ps.SV || 0);
+                ss.SA  = (ss.SA  || 0) + (ps.SA || 0);
+                ss.SO  = (ss.SO  || 0) + (ps.SO || 0);
+              } else {
+                ss.GP   = (ss.GP   || 0) + 1;
+                ss.G    = (ss.G    || 0) + (ps.G    || 0);
+                ss.A    = (ss.A    || 0) + (ps.A    || 0);
+                ss.PTS  = (ss.PTS  || 0) + (ps.G || 0) + (ps.A || 0);
+                ss.PIM  = (ss.PIM  || 0) + (ps.PIM  || 0);
+                ss.SOG  = (ss.SOG  || 0) + (ps.SOG  || 0);
+                ss.PPG  = (ss.PPG  || 0) + (ps.PPG  || 0);
+                ss.SHG  = (ss.SHG  || 0) + (ps.SHG  || 0);
+                ss['+/-'] = (ss['+/-'] || 0) + (ps.plusMinus || 0);
+              }
+              return { ...p, seasonStats: ss };
+            }),
+          };
+        });
+      }
+
+      // Mark game completed in schedule
+      gameSlot.status = 'completed';
+      gameSlot.result = result;
+
+      dayResults.push({ gameSlot, result, recap });
+    }
+
+    // Update storyline tracker
+    const newTracker = updateStorylineTracker(
+      prev.storylineTracker || initStorylineTracker(),
+      dayResults,
+      teams,
+    );
+
+    // Update schedule with completed games
+    const newSchedule = cal.schedule.map(d => {
+      if (d.date !== currentDate) return d;
+      return { ...d, games: todayEntry.games };
+    });
+
+    const nextDate = getNextDate(currentDate);
+    const newCal = {
+      ...cal,
+      schedule: newSchedule,
+      currentDate: nextDate,
+      currentDayIndex: cal.currentDayIndex + 1,
+      completedDays: cal.completedDays + 1,
+      lastDayResults: dayResults,
+    };
+
+    return { ...prev, teams, seasonCalendar: newCal, storylineTracker: newTracker };
+  });
+}
+
+// ---- Bulk sim functions ----
+function advanceToNextUserGame(leagueState) {
+  const cal = leagueState.seasonCalendar;
+  if (!cal) return leagueState;
+
+  const { schedule, currentDate } = cal;
+  // Find next user game date from currentDate onward
+  const future = schedule.filter(d => d.date >= currentDate && d.games.some(g => g.isUserGame && g.status === 'scheduled'));
+  if (!future.length) return leagueState; // no more user games
+
+  const targetDate = future[0].date;
+  // We'll return the target date so the caller can loop advanceDay
+  return targetDate;
+}
+
+function buildBulkSummary(dayResultsArr, teams) {
+  // dayResultsArr: array of arrays of dayResults
+  const allResults = dayResultsArr.flat();
+  const teamRecords = {};
+  TEAM_DEFS.forEach(t => { teamRecords[t.id] = { W:0, L:0, OTL:0, GF:0, GA:0 }; });
+  for (const { result } of allResults) {
+    if (!result) continue;
+    const homeWon = result.homeScore > result.awayScore;
+    const wasOT   = result.overtimes > 0 || result.shootout;
+    const hid = result.homeTeamId, aid = result.awayTeamId;
+    if (teamRecords[hid]) {
+      teamRecords[hid].GF += result.homeScore; teamRecords[hid].GA += result.awayScore;
+      if (homeWon) teamRecords[hid].W++;
+      else if (wasOT) teamRecords[hid].OTL++;
+      else teamRecords[hid].L++;
+    }
+    if (teamRecords[aid]) {
+      teamRecords[aid].GF += result.awayScore; teamRecords[aid].GA += result.homeScore;
+      if (!homeWon) teamRecords[aid].W++;
+      else if (wasOT) teamRecords[aid].OTL++;
+      else teamRecords[aid].L++;
+    }
+  }
+  return { teamRecords, gamesSimulated: allResults.length };
+}
+
+
 
 // ============================================================
 // PHASE 6B — TEAM STRATEGY CONSTANTS
@@ -6015,6 +6869,619 @@ function LeagueStrategyView({ teams }) {
 }
 
 // ============================================================
+// PHASE 9C-D — UI COMPONENTS
+// ============================================================
+
+// ---- Around the League Feed ----
+function AroundTheLeagueFeed({ feed, teams }) {
+  if (!feed || feed.length === 0) return null;
+  return (
+    <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+      <h3 className="text-yellow-400 font-bold text-sm mb-3 uppercase tracking-wide">Around the League</h3>
+      <div className="space-y-2">
+        {feed.map((item, i) => (
+          <div key={i} className="flex items-start gap-2 text-sm">
+            <span className="text-lg leading-none mt-0.5">{item.icon}</span>
+            <span className="text-gray-300">{item.text}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---- Standings Mini Table ----
+function StandingsMini({ teams }) {
+  const sorted = [...teams].sort((a, b) => {
+    const ptsA = (a.seasonStats.W * 2) + (a.seasonStats.OTL || 0);
+    const ptsB = (b.seasonStats.W * 2) + (b.seasonStats.OTL || 0);
+    return ptsB - ptsA;
+  });
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="px-4 py-2 border-b border-gray-700">
+        <span className="text-xs font-bold text-gray-400 uppercase tracking-wide">Standings</span>
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-gray-500 text-xs">
+            <th className="text-left px-3 py-1">Team</th>
+            <th className="px-2 py-1">W</th>
+            <th className="px-2 py-1">L</th>
+            <th className="px-2 py-1">OTL</th>
+            <th className="px-2 py-1 text-yellow-400">PTS</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((t, i) => {
+            const pts = t.seasonStats.W * 2 + (t.seasonStats.OTL || 0);
+            const isUser = t.id === USER_TEAM_ID;
+            return (
+              <tr key={t.id} className={isUser ? 'bg-blue-900/30' : i % 2 === 0 ? 'bg-gray-750' : ''}>
+                <td className="px-3 py-1">
+                  <span className={`font-semibold ${isUser ? 'text-blue-300' : 'text-gray-200'}`}>
+                    {i + 1}. {t.abbr}
+                  </span>
+                </td>
+                <td className="px-2 py-1 text-center text-gray-300">{t.seasonStats.W}</td>
+                <td className="px-2 py-1 text-center text-gray-400">{t.seasonStats.L}</td>
+                <td className="px-2 py-1 text-center text-gray-400">{t.seasonStats.OTL || 0}</td>
+                <td className="px-2 py-1 text-center font-bold text-yellow-300">{pts}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ---- Game Recap Detail Screen ----
+function GameRecapView({ recap, result, teams, onClose }) {
+  if (!recap || !result) return null;
+  const ht = teams.find(t => t.id === result.homeTeamId);
+  const at = teams.find(t => t.id === result.awayTeamId);
+
+  return (
+    <div className="bg-gray-900 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="bg-gray-800 px-6 py-4 flex items-center justify-between border-b border-gray-700">
+        <div>
+          <div className="text-xs text-gray-400 mb-1">{result.date ? formatDateFull(result.date) : ''}</div>
+          <div className="flex items-center gap-4">
+            <div className="text-center">
+              <div className="text-lg font-bold text-white">{at?.name || at?.id}</div>
+              <div className="text-3xl font-black text-gray-200">{result.awayScore}</div>
+            </div>
+            <div className="text-gray-500 text-xl font-light">@</div>
+            <div className="text-center">
+              <div className="text-lg font-bold text-white">{ht?.name || ht?.id}</div>
+              <div className="text-3xl font-black text-gray-200">{result.homeScore}</div>
+            </div>
+          </div>
+          {result.overtimes > 0 && <div className="text-xs text-orange-400 mt-1">{result.shootout ? 'SO' : `OT${result.overtimes > 1 ? result.overtimes : ''}`}</div>}
+        </div>
+        <button onClick={onClose} className="text-gray-400 hover:text-white text-2xl leading-none">✕</button>
+      </div>
+
+      {/* Tags */}
+      {recap.tags && recap.tags.length > 0 && (
+        <div className="px-6 py-3 bg-gray-850 border-b border-gray-700 flex flex-wrap gap-2">
+          {recap.tags.slice(0, 6).map(tag => (
+            <span key={tag} className="bg-gray-700 text-gray-300 text-xs px-2 py-0.5 rounded-full">
+              {tag.replace(/_/g, ' ')}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Headline */}
+      <div className="px-6 py-5 border-b border-gray-700">
+        <h2 className="text-xl font-bold text-white mb-1">{recap.headline}</h2>
+        <p className="text-gray-400 text-sm italic">{recap.subheadline}</p>
+      </div>
+
+      {/* Body */}
+      <div className="px-6 py-4 space-y-3 border-b border-gray-700">
+        {(recap.body || []).map((para, i) => (
+          <p key={i} className="text-gray-300 text-sm leading-relaxed">{para}</p>
+        ))}
+      </div>
+
+      {/* Three Stars */}
+      {recap.stars && recap.stars.length > 0 && (
+        <div className="px-6 py-4 border-b border-gray-700">
+          <h3 className="text-yellow-400 font-bold text-sm mb-3 uppercase tracking-wide">Three Stars</h3>
+          <div className="space-y-2">
+            {recap.stars.map((star, i) => {
+              const starTeam = teams.find(t => t.id === star.team);
+              const medals = ['⭐⭐⭐', '⭐⭐', '⭐'];
+              return (
+                <div key={i} className="flex items-center justify-between text-sm">
+                  <div className="flex items-center gap-2">
+                    <span>{medals[i] || '⭐'}</span>
+                    <span className="font-semibold text-white">{star.name}</span>
+                    <span className="text-gray-500 text-xs">({starTeam?.abbr || star.team})</span>
+                  </div>
+                  <span className="text-gray-400 text-xs">
+                    {star.isGoalie
+                      ? `${star.saves || 0} SV / ${star.shotsAgainst || 0} SA`
+                      : `${star.goals || 0}G ${star.assists || 0}A`}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Box Score placeholder */}
+      {result.playerStats && (
+        <div className="px-6 py-4">
+          <h3 className="text-gray-400 font-bold text-sm mb-3 uppercase tracking-wide">Scoring Leaders</h3>
+          <div className="space-y-1">
+            {Object.values(result.playerStats)
+              .filter(p => !p.isGoalie && ((p.goals || 0) + (p.assists || 0)) > 0)
+              .sort((a, b) => ((b.goals || 0) + (b.assists || 0)) - ((a.goals || 0) + (a.assists || 0)))
+              .slice(0, 6)
+              .map((p, i) => {
+                const pt = teams.find(t => t.id === p.team);
+                return (
+                  <div key={i} className="flex items-center justify-between text-sm">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-white">{p.name}</span>
+                      <span className="text-gray-500 text-xs">({pt?.abbr || p.team})</span>
+                    </div>
+                    <span className="text-gray-300 text-xs">
+                      {p.goals > 0 ? `${p.goals}G ` : ''}{p.assists > 0 ? `${p.assists}A ` : ''}
+                      ({(p.goals || 0) + (p.assists || 0)} PTS)
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Day Results Panel ----
+function DayResultsPanel({ dayResults, teams, onViewRecap }) {
+  if (!dayResults || dayResults.length === 0) return null;
+  return (
+    <div className="space-y-3">
+      {dayResults.map((gr, i) => {
+        const { result, recap } = gr;
+        if (!result) return null;
+        const ht = teams.find(t => t.id === result.homeTeamId);
+        const at = teams.find(t => t.id === result.awayTeamId);
+        const homeWon = result.homeScore > result.awayScore;
+        const userInvolved = result.homeTeamId === USER_TEAM_ID || result.awayTeamId === USER_TEAM_ID;
+        const otLabel = result.shootout ? ' (SO)' : result.overtimes > 0 ? ' (OT)' : '';
+        return (
+          <div key={i} className={`rounded-xl border p-4 ${userInvolved ? 'border-blue-500/50 bg-blue-900/20' : 'border-gray-700 bg-gray-800'}`}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                {/* Away */}
+                <div className={`text-right ${!homeWon ? 'opacity-100' : 'opacity-60'}`}>
+                  <div className="text-sm font-semibold text-white">{at?.abbr || at?.id}</div>
+                  <div className={`text-2xl font-black ${!homeWon ? 'text-green-400' : 'text-gray-400'}`}>{result.awayScore}</div>
+                </div>
+                <div className="text-gray-500 text-sm">@</div>
+                {/* Home */}
+                <div className={`text-left ${homeWon ? 'opacity-100' : 'opacity-60'}`}>
+                  <div className="text-sm font-semibold text-white">{ht?.abbr || ht?.id}</div>
+                  <div className={`text-2xl font-black ${homeWon ? 'text-green-400' : 'text-gray-400'}`}>{result.homeScore}</div>
+                </div>
+                {otLabel && <span className="text-xs text-orange-400 font-bold">{otLabel}</span>}
+              </div>
+              {userInvolved && <span className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded-full">YOUR TEAM</span>}
+            </div>
+            {recap && <div className="text-xs text-gray-400 italic mb-2">{recap.headline}</div>}
+            {recap && recap.tags && (
+              <div className="flex flex-wrap gap-1 mb-2">
+                {recap.tags.slice(0, 3).map(tag => (
+                  <span key={tag} className="text-xs bg-gray-700 text-gray-400 px-1.5 py-0.5 rounded">
+                    {tag.replace(/_/g, ' ')}
+                  </span>
+                ))}
+              </div>
+            )}
+            {recap && (
+              <button onClick={() => onViewRecap && onViewRecap(result, recap)}
+                className="text-xs text-blue-400 hover:text-blue-300 transition">
+                Read full recap →
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---- Calendar Mini View ----
+function CalendarMiniView({ schedule, currentDate, teams, onViewDay }) {
+  const userTeamId = USER_TEAM_ID;
+  // Show current month + partial next month
+  const curD = strToDate(currentDate);
+  const curYear = curD.getFullYear();
+  const curMonth = curD.getMonth();
+
+  // Build grid for current month
+  const firstDay = new Date(curYear, curMonth, 1);
+  const lastDay  = new Date(curYear, curMonth + 1, 0);
+  const startDow = firstDay.getDay();
+
+  // Build day data
+  const dayData = {};
+  schedule.forEach(dayEntry => {
+    const d = strToDate(dayEntry.date);
+    if (d.getFullYear() === curYear && d.getMonth() === curMonth) {
+      const hasUser = dayEntry.games.some(g => g.homeTeamId === userTeamId || g.awayTeamId === userTeamId);
+      const allDone = dayEntry.games.every(g => g.status === 'completed');
+      dayData[d.getDate()] = { hasGames: dayEntry.games.length > 0, hasUser, allDone, count: dayEntry.games.length, date: dayEntry.date };
+    }
+  });
+
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push(null);
+  for (let d = 1; d <= lastDay.getDate(); d++) cells.push(d);
+
+  const todayStr = currentDate;
+  const todayNum = curD.getDate();
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="px-4 py-2 border-b border-gray-700 flex items-center justify-between">
+        <span className="text-sm font-bold text-white">
+          {MONTH_NAMES[curMonth]} {curYear}
+        </span>
+        <span className="text-xs text-gray-400">{schedule.filter(d => d.date >= currentDate).length} game days left</span>
+      </div>
+      <div className="p-3">
+        <div className="grid grid-cols-7 gap-1 mb-1">
+          {['Su','Mo','Tu','We','Th','Fr','Sa'].map(d => (
+            <div key={d} className="text-center text-xs text-gray-500 font-medium">{d}</div>
+          ))}
+        </div>
+        <div className="grid grid-cols-7 gap-1">
+          {cells.map((day, i) => {
+            if (!day) return <div key={`e${i}`} />;
+            const info = dayData[day];
+            const thisDateStr = dateToStr(new Date(curYear, curMonth, day));
+            const isCurrent = thisDateStr === todayStr;
+            const isPast    = thisDateStr < todayStr;
+            let cls = 'h-8 w-full rounded text-xs flex items-center justify-center font-medium relative ';
+            if (isCurrent) cls += 'bg-blue-600 text-white ring-2 ring-blue-400 ';
+            else if (info?.hasUser && !isPast) cls += 'bg-indigo-900/60 text-indigo-300 border border-indigo-600 ';
+            else if (info?.hasGames && !isPast) cls += 'bg-gray-700 text-gray-200 ';
+            else if (info?.allDone && isPast) cls += 'bg-gray-750 text-gray-500 ';
+            else cls += 'text-gray-600 ';
+            return (
+              <button key={day} onClick={() => info && onViewDay && onViewDay(thisDateStr)}
+                className={cls} title={info ? `${info.count} game(s)` : ''}>
+                {day}
+                {info?.hasUser && !isPast && <span className="absolute top-0.5 right-0.5 w-1 h-1 bg-yellow-400 rounded-full" />}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Bulk Sim Summary Panel ----
+function BulkSimSummaryPanel({ summary, teams, onDismiss }) {
+  if (!summary) return null;
+  const { teamRecords, gamesSimulated, daysAdvanced } = summary;
+  const userRec = teamRecords[USER_TEAM_ID] || { W:0, L:0, OTL:0 };
+  const userTeam = teams.find(t => t.id === USER_TEAM_ID);
+  return (
+    <div className="bg-gray-800 rounded-xl border border-yellow-700 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-yellow-400 font-bold text-sm uppercase tracking-wide">
+          Bulk Sim Complete — {gamesSimulated} game{gamesSimulated !== 1 ? 's' : ''} simulated
+        </h3>
+        <button onClick={onDismiss} className="text-gray-500 hover:text-gray-300 text-sm">✕</button>
+      </div>
+      <div className="mb-3 p-3 bg-blue-900/30 rounded-lg border border-blue-700/40">
+        <div className="text-blue-300 text-xs font-semibold mb-1">{userTeam?.name || USER_TEAM_ID} Results</div>
+        <div className="text-white font-bold text-lg">{userRec.W}W – {userRec.L}L – {userRec.OTL}OTL</div>
+        <div className="text-blue-400 text-xs">{(userRec.W * 2 + userRec.OTL)} pts earned in this stretch</div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {Object.entries(teamRecords)
+          .filter(([id]) => id !== USER_TEAM_ID)
+          .map(([id, rec]) => {
+            const t = teams.find(tt => tt.id === id);
+            return (
+              <div key={id} className="flex items-center justify-between bg-gray-750 rounded px-3 py-1.5 text-xs">
+                <span className="text-gray-300 font-medium">{t?.abbr || id}</span>
+                <span className="text-gray-400">{rec.W}-{rec.L}-{rec.OTL}</span>
+              </div>
+            );
+          })}
+      </div>
+    </div>
+  );
+}
+
+// ---- Main Schedule / Game Day Hub View ----
+function ScheduleView({
+  seasonCalendar,
+  storylineTracker,
+  teams,
+  onAdvanceDay,
+  onAdvanceWeek,
+  onAdvanceToUserGame,
+  onStartCalendar,
+  seasonPhase,
+  seasonSimulated,
+  lastViewedRecap,
+  onSetRecap,
+}) {
+  const [viewMode, setViewMode] = React.useState('hub'); // 'hub' | 'recap' | 'calendar'
+  const [activeRecap, setActiveRecap] = React.useState(null);
+  const [bulkSummary, setBulkSummary] = React.useState(null);
+  const [simming, setSimming] = React.useState(false);
+
+  const cal = seasonCalendar;
+  const canStart = !cal && (seasonPhase === 'preseason' || seasonPhase === 'regularSeason') && !seasonSimulated;
+
+  function handleAdvanceDay() {
+    if (simming) return;
+    setSimming(true);
+    onAdvanceDay();
+    setTimeout(() => setSimming(false), 100);
+    setBulkSummary(null);
+  }
+
+  async function handleBulkWeek() {
+    if (simming || !cal) return;
+    setSimming(true);
+    setBulkSummary(null);
+    const collected = [];
+    let daysLeft = 7;
+    // We call onAdvanceDay repeatedly — in practice, parent loops via state updates
+    // For simplicity, we trigger a week advance by calling onAdvanceWeek
+    onAdvanceWeek && onAdvanceWeek((summary) => {
+      setBulkSummary(summary);
+      setSimming(false);
+    });
+  }
+
+  async function handleBulkToUserGame() {
+    if (simming || !cal) return;
+    setSimming(true);
+    setBulkSummary(null);
+    onAdvanceToUserGame && onAdvanceToUserGame((summary) => {
+      setBulkSummary(summary);
+      setSimming(false);
+    });
+  }
+
+  function handleViewRecap(result, recap) {
+    setActiveRecap({ result, recap });
+    setViewMode('recap');
+  }
+
+  if (!cal) {
+    return (
+      <div className="p-8 text-center max-w-lg mx-auto">
+        <div className="text-5xl mb-4">📅</div>
+        <h2 className="text-white text-2xl font-bold mb-3">Day-by-Day Season</h2>
+        <p className="text-gray-400 mb-6">
+          Start the calendar to simulate your season one day at a time — watch the standings shift,
+          follow storylines, and relive every game with full recaps.
+        </p>
+        {canStart ? (
+          <button onClick={onStartCalendar}
+            className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-8 rounded-xl text-lg transition">
+            🏒 Start Calendar Season
+          </button>
+        ) : (
+          <div className="text-yellow-400 text-sm">
+            {seasonSimulated ? 'Season already simulated via bulk mode. Start a new season to use the calendar.' : 'Available in preseason.'}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const isOver = cal.currentDate > cal.seasonEndDate;
+  const today = cal.schedule.find(d => d.date === cal.currentDate);
+  const lastResults = cal.lastDayResults || [];
+  const nextUserGame = cal.schedule.find(d =>
+    d.date >= cal.currentDate && d.games.some(g => g.isUserGame && g.status === 'scheduled')
+  );
+  const gamesLeft = cal.schedule.reduce((acc, d) => acc + d.games.filter(g => g.status === 'scheduled').length, 0);
+  const userTeam = teams.find(t => t.id === USER_TEAM_ID);
+  const feed = storylineTracker?.aroundTheLeague || [];
+
+  return (
+    <div className="p-4 space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-white text-xl font-bold">
+            {isOver ? 'Season Complete' : formatDateFull(cal.currentDate)}
+          </h2>
+          <div className="text-gray-400 text-sm">
+            {gamesLeft} games remaining · Day {cal.completedDays || 0} of season
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => setViewMode('hub')}
+            className={`px-3 py-1 rounded text-sm font-medium transition ${viewMode === 'hub' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+            Hub
+          </button>
+          <button onClick={() => setViewMode('calendar')}
+            className={`px-3 py-1 rounded text-sm font-medium transition ${viewMode === 'calendar' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+            Calendar
+          </button>
+        </div>
+      </div>
+
+      {viewMode === 'recap' && activeRecap && (
+        <GameRecapView
+          recap={activeRecap.recap}
+          result={activeRecap.result}
+          teams={teams}
+          onClose={() => setViewMode('hub')}
+        />
+      )}
+
+      {viewMode === 'calendar' && (
+        <CalendarMiniView
+          schedule={cal.schedule}
+          currentDate={cal.currentDate}
+          teams={teams}
+          onViewDay={(date) => {
+            // Show results for a past day
+            const entry = cal.schedule.find(d => d.date === date);
+            if (entry && entry.games.some(g => g.status === 'completed')) {
+              const completedGames = entry.games.filter(g => g.status === 'completed' && g.result);
+              if (completedGames.length > 0 && completedGames[0].result?.recap) {
+                setActiveRecap({ result: completedGames[0].result, recap: completedGames[0].result.recap });
+                setViewMode('recap');
+              }
+            }
+          }}
+        />
+      )}
+
+      {viewMode === 'hub' && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Left: Controls + Results */}
+          <div className="lg:col-span-2 space-y-4">
+            {/* Action buttons */}
+            {!isOver && (
+              <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+                <div className="text-sm font-semibold text-gray-300 mb-3">
+                  {today && today.games.length > 0
+                    ? `${today.games.length} game${today.games.length !== 1 ? 's' : ''} scheduled today`
+                    : 'No games today — advance to next game day'}
+                </div>
+                {nextUserGame && (
+                  <div className="mb-3 p-2 bg-indigo-900/30 rounded border border-indigo-700/40 text-sm">
+                    <span className="text-indigo-300 font-semibold">Next {userTeam?.abbr || 'Your'} game:</span>{' '}
+                    <span className="text-white">
+                      {nextUserGame.games.filter(g => g.isUserGame)[0]?.awayTeamId === USER_TEAM_ID
+                        ? `@ ${teams.find(t => t.id === nextUserGame.games.find(g => g.isUserGame)?.homeTeamId)?.name}`
+                        : `vs ${teams.find(t => t.id === nextUserGame.games.find(g => g.isUserGame)?.awayTeamId)?.name}`}
+                      {' — '}{formatDate(nextUserGame.date)}
+                    </span>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={handleAdvanceDay} disabled={simming || isOver}
+                    className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold py-2 px-4 rounded-lg text-sm transition">
+                    {simming ? '⏳ Simming...' : '▶ Advance Day'}
+                  </button>
+                  <button onClick={handleBulkWeek} disabled={simming || isOver}
+                    className="bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-lg text-sm transition">
+                    ⏩ Sim Week
+                  </button>
+                  <button onClick={handleBulkToUserGame} disabled={simming || isOver || !nextUserGame}
+                    className="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-lg text-sm transition">
+                    ⚡ To My Next Game
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {isOver && (
+              <div className="bg-green-900/30 border border-green-600 rounded-xl p-4 text-center">
+                <div className="text-2xl mb-2">🏁</div>
+                <div className="text-green-300 font-bold text-lg">Regular Season Complete!</div>
+                <div className="text-gray-400 text-sm mt-1">Navigate to Awards to proceed.</div>
+              </div>
+            )}
+
+            {/* Bulk sim summary */}
+            {bulkSummary && (
+              <BulkSimSummaryPanel
+                summary={bulkSummary}
+                teams={teams}
+                onDismiss={() => setBulkSummary(null)}
+              />
+            )}
+
+            {/* Today's results */}
+            {lastResults.length > 0 && (
+              <div>
+                <div className="text-sm font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+                  Yesterday's Results
+                </div>
+                <DayResultsPanel
+                  dayResults={lastResults}
+                  teams={teams}
+                  onViewRecap={handleViewRecap}
+                />
+              </div>
+            )}
+
+            {/* Upcoming games */}
+            {!isOver && today && today.games.some(g => g.status === 'scheduled') && (
+              <div>
+                <div className="text-sm font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+                  Today's Games
+                </div>
+                <div className="space-y-2">
+                  {today.games.filter(g => g.status === 'scheduled').map((g, i) => {
+                    const ht = teams.find(t => t.id === g.homeTeamId);
+                    const at = teams.find(t => t.id === g.awayTeamId);
+                    return (
+                      <div key={i} className={`rounded-xl border p-3 flex items-center justify-between text-sm ${g.isUserGame ? 'border-blue-500/50 bg-blue-900/20' : 'border-gray-700 bg-gray-800'}`}>
+                        <span className="text-white font-medium">{at?.name || at?.id}</span>
+                        <span className="text-gray-500 text-xs">@ {ht?.city || ht?.name}</span>
+                        <span className="text-white font-medium">{ht?.name || ht?.id}</span>
+                        {g.isUserGame && <span className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded-full ml-2">YOU</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right: Standings + Feed + Streaks */}
+          <div className="space-y-4">
+            <StandingsMini teams={teams} />
+            {storylineTracker && Object.keys(storylineTracker.streaks || {}).length > 0 && (
+              <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+                <h3 className="text-gray-400 font-bold text-xs mb-3 uppercase tracking-wide">Team Streaks</h3>
+                <div className="space-y-1">
+                  {Object.entries(storylineTracker.streaks)
+                    .filter(([, s]) => s.count >= 3)
+                    .sort((a, b) => b[1].count - a[1].count)
+                    .slice(0, 5)
+                    .map(([teamId, streak]) => {
+                      const t = teams.find(tt => tt.id === teamId);
+                      const icon = streak.type === 'win' ? '🔥' : '❄️';
+                      const color = streak.type === 'win' ? 'text-green-400' : 'text-blue-400';
+                      return (
+                        <div key={teamId} className="flex items-center justify-between text-sm">
+                          <span className="text-gray-300">{t?.name || teamId}</span>
+                          <span className={`font-bold ${color}`}>{icon} {streak.count} {streak.type.toUpperCase()}</span>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+            <AroundTheLeagueFeed feed={feed} teams={teams} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ============================================================
 // MAIN APP COMPONENT — PHASE 2 (MULTI-SEASON)
 // ============================================================
 
@@ -6037,6 +7504,10 @@ export default function HockeySimGame() {
       developmentResults: null,
       retiredThisOffseason: null,
       offseasonSummary: null,
+      // Phase 9C-D
+      seasonCalendar: null,
+      storylineTracker: initStorylineTracker(),
+      lastViewedRecap: null,
     };
   });
 
@@ -6045,6 +7516,7 @@ export default function HockeySimGame() {
     seasonPhase, playoffs, awards,
     currentSeason, history, offseasonStep, draftState,
     developmentResults, retiredThisOffseason, offseasonSummary,
+    seasonCalendar, storylineTracker, lastViewedRecap,
   } = leagueState;
 
   const mgmtLocked = ['playoffsSemifinals','playoffsFinals','championship'].includes(seasonPhase);
@@ -6065,7 +7537,97 @@ export default function HockeySimGame() {
       history: { seasons: [], retiredPlayers: [], draftHistory: [] },
       offseasonStep: null, draftState: null, developmentResults: null,
       retiredThisOffseason: null, offseasonSummary: null,
+      seasonCalendar: null, storylineTracker: initStorylineTracker(), lastViewedRecap: null,
     });
+  }
+
+  // --- Phase 9C-D: Calendar Season Handlers ---
+  function handleStartCalendar() {
+    const cal = initSeasonCalendar(leagueState.currentSeason || 1);
+    setLeagueState(prev => ({
+      ...prev,
+      seasonCalendar: cal,
+      storylineTracker: initStorylineTracker(),
+      seasonPhase: 'regularSeason',
+    }));
+  }
+
+  function handleAdvanceDay() {
+    advanceDay(leagueState, setLeagueState);
+    // Check if season ended after advance
+    setLeagueState(prev => {
+      if (!prev.seasonCalendar) return prev;
+      const cal = prev.seasonCalendar;
+      const allDone = cal.schedule.every(d => d.games.every(g => g.status === 'completed'));
+      if (allDone && prev.seasonPhase === 'regularSeason') {
+        const newAwards = calculateAwards(prev.teams);
+        return { ...prev, seasonSimulated: true, seasonPhase: 'postRegularSeason', awards: newAwards };
+      }
+      return prev;
+    });
+  }
+
+  function handleAdvanceWeek(onDone) {
+    // Advance up to 7 days collecting results
+    let daysLeft = 7;
+    const allDayResults = [];
+    function step() {
+      setLeagueState(prev => {
+        if (!prev.seasonCalendar || daysLeft <= 0) {
+          const summary = buildBulkSummary(allDayResults, prev.teams);
+          if (onDone) onDone(summary);
+          return prev;
+        }
+        const cal = prev.seasonCalendar;
+        if (cal.currentDate > cal.seasonEndDate) {
+          const summary = buildBulkSummary(allDayResults, prev.teams);
+          if (onDone) onDone(summary);
+          return prev;
+        }
+        daysLeft--;
+        return prev; // actual advance happens via advanceDay
+      });
+      if (daysLeft > 0) {
+        advanceDay(leagueState, setLeagueState);
+        setTimeout(step, 50);
+      }
+    }
+    step();
+  }
+
+  function handleAdvanceToUserGame(onDone) {
+    function step() {
+      setLeagueState(prev => {
+        if (!prev.seasonCalendar) return prev;
+        const cal = prev.seasonCalendar;
+        if (cal.currentDate > cal.seasonEndDate) {
+          if (onDone) onDone(buildBulkSummary([], prev.teams));
+          return prev;
+        }
+        // Check if today has a user game
+        const today = cal.schedule.find(d => d.date === cal.currentDate);
+        const hasUserGame = today && today.games.some(g => g.isUserGame && g.status === 'scheduled');
+        if (hasUserGame) {
+          if (onDone) onDone(buildBulkSummary([], prev.teams));
+          return prev;
+        }
+        return prev;
+      });
+      // Continue advancing
+      advanceDay(leagueState, setLeagueState);
+      setTimeout(() => {
+        setLeagueState(prev => {
+          if (!prev.seasonCalendar) return prev;
+          const cal = prev.seasonCalendar;
+          if (cal.currentDate > cal.seasonEndDate) return prev;
+          const today = cal.schedule.find(d => d.date === cal.currentDate);
+          const hasUserGame = today && today.games.some(g => g.isUserGame && g.status === 'scheduled');
+          if (!hasUserGame) setTimeout(step, 80);
+          return prev;
+        });
+      }, 80);
+    }
+    step();
   }
 
   // --- Regular Season Simulation ---
@@ -6396,6 +7958,10 @@ export default function HockeySimGame() {
       retiredThisOffseason: null,
       offseasonSummary: null,
       currentView: 'dashboard',
+      // Phase 9C-D: reset calendar for new season
+      seasonCalendar: null,
+      storylineTracker: initStorylineTracker(),
+      lastViewedRecap: null,
     }));
   }
 
@@ -6458,7 +8024,8 @@ export default function HockeySimGame() {
     { key: 'dashboard', label: 'Dashboard', icon: '🏠' },
     { key: 'roster', label: 'Rosters', icon: '👥' },
     { key: 'simGame', label: 'Sim Game', icon: '🎮' },
-    { key: 'simSeason', label: 'Sim Season', icon: '📅' },
+    { key: 'schedule', label: 'Schedule', icon: '📅' },
+    { key: 'simSeason', label: 'Sim Season', icon: '🗓️' },
     { key: 'stats', label: 'Season Stats', icon: '📊' },
     { key: 'strategy', label: 'Strategy', icon: '♟️' },
     { key: 'leagueStrategy', label: 'League Strats', icon: '📋' },
@@ -6534,6 +8101,21 @@ export default function HockeySimGame() {
         )}
         {currentView === 'roster' && <RosterView teams={teams} />}
         {currentView === 'simGame' && <SimGameView teams={teams} />}
+        {currentView === 'schedule' && (
+          <ScheduleView
+            seasonCalendar={seasonCalendar}
+            storylineTracker={storylineTracker}
+            teams={teams}
+            onAdvanceDay={handleAdvanceDay}
+            onAdvanceWeek={handleAdvanceWeek}
+            onAdvanceToUserGame={handleAdvanceToUserGame}
+            onStartCalendar={handleStartCalendar}
+            seasonPhase={seasonPhase}
+            seasonSimulated={seasonSimulated}
+            lastViewedRecap={lastViewedRecap}
+            onSetRecap={r => setLeagueState(prev => ({ ...prev, lastViewedRecap: r }))}
+          />
+        )}
         {currentView === 'simSeason' && (
           <div className="p-8 text-center">
             <h2 className="text-white text-2xl font-bold mb-4">Season {currentSeason} Simulator</h2>
