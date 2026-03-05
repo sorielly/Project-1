@@ -6675,8 +6675,9 @@ const OFFSEASON_STEPS = [
   { key: 'summary',          label: 'Season Summary',     icon: '📋' },
   { key: 'development',      label: 'Player Development', icon: '📈' },
   { key: 'retirements',      label: 'Retirements',        icon: '👴' },
+  { key: 'contracts',        label: 'Re-Sign Players',    icon: '✍️' },
   { key: 'draft',            label: 'Entry Draft',        icon: '🎓' },
-  { key: 'freeAgency',       label: 'Free Agency',        icon: '✍️' },
+  { key: 'freeAgency',       label: 'Free Agency',        icon: '🖊️' },
   { key: 'rosterManagement', label: 'Roster Management',  icon: '📋' },
   { key: 'preseasonPreview', label: 'Preseason Preview',  icon: '🏒' },
 ];
@@ -6685,7 +6686,7 @@ function OffseasonWorkflowView({
   step, seasonNum, summary, developmentResults, retiredPlayers, draftState,
   teams, freeAgents, awards, champion,
   onAdvanceStep, onScoutProspect, onDraftPick, onSign, onRelease, onStartNewSeason,
-  userTeamScouting,
+  userTeamScouting, resignState, onReSign, onBuyout,
 }) {
   const stepIndex = OFFSEASON_STEPS.findIndex(s => s.key === step);
 
@@ -6720,6 +6721,16 @@ function OffseasonWorkflowView({
       )}
       {step === 'retirements' && (
         <RetirementsPanel retired={retiredPlayers} onNext={onAdvanceStep} />
+      )}
+      {step === 'contracts' && (
+        <ReSignNegotiationView
+          teams={teams}
+          userTeamId="BLZ"
+          resignState={resignState}
+          onReSign={onReSign}
+          onRelease={onRelease}
+          onNext={onAdvanceStep}
+        />
       )}
       {step === 'draft' && (
         <DraftDayPanel draftState={draftState} teams={teams} onScout={onScoutProspect} onPick={onDraftPick} userTeamScouting={userTeamScouting} />
@@ -8435,6 +8446,300 @@ function ScoutingHubView({ userTeam, freeAgents, draftState, onScout, onScoutFA 
 
 
 // ============================================================
+// PHASE 4 — CAP & CONTRACT UI COMPONENTS
+// ============================================================
+
+// ============================================================
+// PHASE 4 — CAP DASHBOARD VIEW
+// ============================================================
+
+function CapDashboardView({ teams, userTeamId, onBuyout }) {
+  const userTeam = teams.find(t => t.id === userTeamId);
+  if (!userTeam) return null;
+  const cs = userTeam.capState || recalculateCapState(userTeam);
+  const capPct = Math.min(1, cs.totalCapHit / cs.salaryCap);
+  const capColor = capPct > 0.98 ? '#ef4444' : capPct > 0.90 ? '#f97316' : '#22c55e';
+  const players = [...userTeam.players].sort((a, b) => (b.contract?.aav || 0) - (a.contract?.aav || 0));
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-xl font-bold">Cap Dashboard — {userTeam.name}</h2>
+
+      {/* Cap Bar */}
+      <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+        <div className="flex justify-between text-sm mb-2">
+          <span className="text-gray-400">Total Cap Hit</span>
+          <span className="font-bold" style={{ color: capColor }}>{formatSalary(cs.totalCapHit)} / {formatSalary(cs.salaryCap)}</span>
+        </div>
+        <div className="w-full h-3 bg-gray-700 rounded-full overflow-hidden">
+          <div className="h-full rounded-full transition-all" style={{ width: `${capPct * 100}%`, backgroundColor: capColor }} />
+        </div>
+        <div className="flex justify-between text-xs mt-2">
+          <span className="text-gray-400">Cap Space: <span className="text-green-400 font-bold">{formatSalary(cs.capSpace)}</span></span>
+          {cs.deadCap > 0 && <span className="text-orange-400">Dead Cap: {formatSalary(cs.deadCap)}</span>}
+        </div>
+      </div>
+
+      {/* Summary Cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 text-center">
+          <div className="text-gray-400 text-xs mb-1">Active Payroll</div>
+          <div className="text-white font-bold text-sm">{formatSalary(cs.activePayroll)}</div>
+        </div>
+        <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 text-center">
+          <div className="text-gray-400 text-xs mb-1">Dead Cap</div>
+          <div className="text-orange-400 font-bold text-sm">{formatSalary(cs.deadCap)}</div>
+        </div>
+        <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 text-center">
+          <div className="text-gray-400 text-xs mb-1">Expiring</div>
+          <div className="text-yellow-400 font-bold text-sm">{cs.expiringContracts?.length || 0} players</div>
+        </div>
+        <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 text-center">
+          <div className="text-gray-400 text-xs mb-1">Proj. Next Year</div>
+          <div className="text-blue-400 font-bold text-sm">{formatSalary(cs.projectedPayroll)}</div>
+        </div>
+      </div>
+
+      {/* Roster Contracts Table */}
+      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+        <div className="px-4 py-2 border-b border-gray-700">
+          <span className="text-white font-semibold text-sm">Roster Contracts ({players.length} players)</span>
+        </div>
+        <div className="max-h-80 overflow-y-auto">
+          {players.map(p => {
+            const c = p.contract;
+            if (!c) return null;
+            const typeInfo = CONTRACT_TYPES[c.type] || CONTRACT_TYPES.STANDARD;
+            return (
+              <div key={p.id} className="flex items-center px-4 py-2 border-b border-gray-700/50 hover:bg-gray-700/30">
+                <div className="w-5 text-gray-500 text-xs mr-2">{p.position}</div>
+                <div className="flex-1">
+                  <span className="text-white text-sm">{p.firstName} {p.lastName}</span>
+                  <span className="text-gray-400 text-xs ml-2">OVR {p.overall}</span>
+                </div>
+                <span className="text-xs px-1.5 py-0.5 rounded mr-3 font-medium" style={{ backgroundColor: typeInfo.color + '33', color: typeInfo.color }}>{typeInfo.label}</span>
+                <div className="text-right">
+                  <div className="text-white text-sm font-bold">{formatSalary(c.aav)}</div>
+                  <div className="text-gray-400 text-xs">{c.yearsRemaining}yr</div>
+                </div>
+                {onBuyout && c.yearsRemaining >= 2 && c.type !== 'ELC' && (
+                  <button onClick={() => onBuyout(p.id)} className="ml-3 text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-800 hover:border-red-600">
+                    BO
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Buyout contracts */}
+      {cs.buyoutContracts?.length > 0 && (
+        <div className="bg-gray-800 rounded-xl border border-orange-800/50 p-4">
+          <div className="text-orange-400 text-sm font-semibold mb-2">Dead Cap Entries</div>
+          {cs.buyoutContracts.map((bc, i) => (
+            <div key={i} className="flex justify-between text-sm text-gray-300 py-1 border-b border-gray-700/50 last:border-0">
+              <span>{bc.playerName}</span>
+              <span className="text-orange-400">{formatSalary(bc.annualHit)}/yr × {bc.yearsRemaining}yr</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// PHASE 4 — RE-SIGN NEGOTIATION VIEW
+// ============================================================
+
+function ReSignNegotiationView({ teams, userTeamId, resignState, onReSign, onRelease, onNext }) {
+  const userTeam = teams.find(t => t.id === userTeamId);
+  const cs = userTeam ? recalculateCapState(userTeam) : null;
+  const [selectedPlayer, setSelectedPlayer] = React.useState(null);
+  const [offeredAAV, setOfferedAAV]   = React.useState(0);
+  const [offeredTerm, setOfferedTerm] = React.useState(2);
+
+  const expiring = resignState?.expiringPlayers || [];
+  const negotiations = resignState?.negotiations || {};
+  const completed = resignState?.completed || [];
+
+  const unsettled = expiring.filter(p => !completed.includes(p.id) && !negotiations[p.id]?.accepted === false);
+
+  function selectPlayer(p) {
+    const demand = calculatePlayerDemands(p, 1.0);
+    setSelectedPlayer(p);
+    setOfferedAAV(demand.demandAAV);
+    setOfferedTerm(demand.demandTerm);
+  }
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-xl font-bold">Re-Sign Players</h2>
+      {cs && (
+        <div className="flex items-center gap-4 text-sm">
+          <span className="text-gray-400">Cap Space:</span>
+          <span className={cs.capSpace > 5000000 ? 'text-green-400 font-bold' : 'text-orange-400 font-bold'}>{formatSalary(cs.capSpace)}</span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {/* Player list */}
+        <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+          <div className="px-4 py-2 border-b border-gray-700 text-sm text-gray-400 font-semibold">
+            Expiring Contracts ({expiring.length})
+          </div>
+          <div className="max-h-80 overflow-y-auto">
+            {expiring.length === 0 && (
+              <div className="p-4 text-gray-500 text-sm text-center">No expiring contracts</div>
+            )}
+            {expiring.map(p => {
+              const neg = negotiations[p.id];
+              const isDone = completed.includes(p.id);
+              const declined = neg && !neg.accepted;
+              return (
+                <div key={p.id}
+                  onClick={() => !isDone && !declined && selectPlayer(p)}
+                  className={`flex items-center px-3 py-2 border-b border-gray-700/50 cursor-pointer
+                    ${selectedPlayer?.id === p.id ? 'bg-blue-900/40' : 'hover:bg-gray-700/40'}
+                    ${isDone || declined ? 'opacity-50' : ''}`}>
+                  <div className="w-5 text-gray-400 text-xs">{p.position}</div>
+                  <div className="flex-1">
+                    <div className="text-white text-sm">{p.firstName} {p.lastName}</div>
+                    <div className="text-gray-400 text-xs">OVR {p.overall} · {formatSalary(p.contract?.aav)} expiring</div>
+                  </div>
+                  {isDone && <span className="text-green-400 text-xs">Signed ✓</span>}
+                  {declined && <span className="text-red-400 text-xs">Declined ✗</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Negotiation panel */}
+        {selectedPlayer ? (
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-4 space-y-3">
+            <div>
+              <div className="text-white font-bold">{selectedPlayer.firstName} {selectedPlayer.lastName}</div>
+              <div className="text-gray-400 text-sm">{selectedPlayer.position} · OVR {selectedPlayer.overall} · Age {selectedPlayer.age}</div>
+            </div>
+            {(() => {
+              const demand = calculatePlayerDemands(selectedPlayer, 1.0);
+              return (
+                <div className="text-xs text-gray-400 space-y-1">
+                  <div>Asking: <span className="text-yellow-400 font-bold">{formatSalary(demand.demandAAV)}</span> × {demand.demandTerm}yr</div>
+                  <div>Min Accept: <span className="text-orange-400">{formatSalary(demand.minAcceptAAV)}</span></div>
+                </div>
+              );
+            })()}
+            <div>
+              <label className="text-gray-400 text-xs block mb-1">Offer AAV: <span className="text-white font-bold">{formatSalary(offeredAAV)}</span></label>
+              <input type="range"
+                min={CAP_CONFIG.minAAV} max={Math.min(CAP_CONFIG.maxAAV, cs?.capSpace || CAP_CONFIG.maxAAV)}
+                step={100000} value={offeredAAV}
+                onChange={e => setOfferedAAV(Number(e.target.value))}
+                className="w-full" />
+            </div>
+            <div>
+              <label className="text-gray-400 text-xs block mb-1">Term: <span className="text-white font-bold">{offeredTerm} year{offeredTerm !== 1 ? 's' : ''}</span></label>
+              <input type="range" min={1} max={7} step={1} value={offeredTerm}
+                onChange={e => setOfferedTerm(Number(e.target.value))}
+                className="w-full" />
+            </div>
+            {(() => {
+              const demand = calculatePlayerDemands(selectedPlayer, 1.0);
+              const prob = calculateAcceptanceProbability(offeredAAV, demand.demandAAV, demand.minAcceptAAV);
+              return (
+                <div className="text-xs text-center">
+                  <span className="text-gray-400">Acceptance chance: </span>
+                  <span className={prob >= 0.7 ? 'text-green-400' : prob >= 0.4 ? 'text-yellow-400' : 'text-red-400'} style={{ fontWeight: 'bold' }}>
+                    {Math.round(prob * 100)}%
+                  </span>
+                </div>
+              );
+            })()}
+            <div className="flex gap-2">
+              <button onClick={() => onReSign(selectedPlayer.id, offeredAAV, offeredTerm)}
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-sm py-2 rounded">
+                Make Offer
+              </button>
+              <button onClick={() => { onRelease && onRelease(USER_TEAM_ID, selectedPlayer.id); setSelectedPlayer(null); }}
+                className="flex-1 bg-gray-700 hover:bg-gray-600 text-white text-sm py-2 rounded">
+                Let Walk
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-8 text-center text-gray-500 text-sm">
+            Select a player to negotiate
+          </div>
+        )}
+      </div>
+
+      <button onClick={onNext}
+        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl">
+        Continue to Draft →
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// PHASE 4 — BUYOUT CONFIRMATION VIEW
+// ============================================================
+
+function BuyoutConfirmationView({ player, team, onConfirm, onCancel }) {
+  if (!player) return null;
+  const buyout = calculateBuyout(player);
+  if (!buyout) return null;
+
+  const cs = recalculateCapState(team);
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-900 border border-orange-600 rounded-2xl p-6 max-w-md w-full space-y-4">
+        <h2 className="text-white text-xl font-bold">Buyout Confirmation</h2>
+        <div className="bg-gray-800 rounded-xl p-4 space-y-2 text-sm">
+          <div className="flex justify-between">
+            <span className="text-gray-400">Player</span>
+            <span className="text-white font-bold">{player.firstName} {player.lastName}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-gray-400">Contract</span>
+            <span className="text-white">{formatSalary(player.contract?.aav)} × {player.contract?.yearsRemaining}yr</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-gray-400">Remaining Value</span>
+            <span className="text-white">{formatSalary(buyout.remainingValue)}</span>
+          </div>
+          <div className="border-t border-gray-700 pt-2 mt-2">
+            <div className="flex justify-between font-bold">
+              <span className="text-orange-400">Buyout Cost</span>
+              <span className="text-orange-400">{formatSalary(buyout.buyoutCost)}</span>
+            </div>
+            <div className="flex justify-between text-xs text-gray-400 mt-1">
+              <span>Annual Dead Cap Hit</span>
+              <span>{formatSalary(buyout.annualHit)} × {buyout.buyoutYears}yr</span>
+            </div>
+          </div>
+        </div>
+        <div className="text-xs text-gray-400 bg-gray-800 rounded-lg p-3">
+          After buyout, cap space increases from <span className="text-green-400">{formatSalary(cs.capSpace)}</span> to{' '}
+          <span className="text-green-400">{formatSalary(cs.capSpace + (player.contract?.aav || 0) - buyout.annualHit)}</span>
+        </div>
+        <div className="flex gap-3">
+          <button onClick={onCancel} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2 rounded-lg">Cancel</button>
+          <button onClick={onConfirm} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 rounded-lg">
+            Confirm Buyout
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
 // PHASE 9C-D — UI COMPONENTS
 // ============================================================
 
@@ -9074,6 +9379,8 @@ export default function HockeySimGame() {
       seasonCalendar: null,
       storylineTracker: initStorylineTracker(),
       lastViewedRecap: null,
+      // Phase 4
+      resignState: null,
     };
   });
 
@@ -9083,6 +9390,7 @@ export default function HockeySimGame() {
     currentSeason, history, offseasonStep, draftState,
     developmentResults, retiredThisOffseason, offseasonSummary,
     seasonCalendar, storylineTracker, lastViewedRecap,
+    resignState,
   } = leagueState;
 
   const mgmtLocked = ['playoffsSemifinals','playoffsFinals','championship'].includes(seasonPhase);
@@ -9413,6 +9721,22 @@ export default function HockeySimGame() {
         return { ...prev, teams: teamsAfterRet, freeAgents: fasAfterRet, history: updatedHistory, offseasonStep: 'retirements', retiredThisOffseason: retiredPlayers };
       }
 
+      // When advancing TO contracts step (re-signing)
+      if (nextStep.key === 'contracts') {
+        // Build list of expiring players for user team, AI teams auto-sign
+        const teamsWithExpiring = prev.teams.map(team => {
+          if (team.id === USER_TEAM_ID) return team;  // user handles manually
+          // AI: re-sign players and handle cap
+          let t = aiReSignPlayers(team, prev.currentSeason);
+          t = aiConsiderBuyouts(t);
+          return t;
+        });
+        // Build expiring list for user team
+        const userTeam = teamsWithExpiring.find(t => t.id === USER_TEAM_ID);
+        const expiringPlayers = (userTeam?.players || []).filter(p => p.contract && (p.contract.yearsRemaining <= 1 || p.contract.status === 'expired'));
+        return { ...prev, teams: teamsWithExpiring, offseasonStep: 'contracts', resignState: { expiringPlayers, negotiations: {}, completed: [] } };
+      }
+
       // When advancing TO draft step
       if (nextStep.key === 'draft') {
         const usedNames = new Set(
@@ -9469,6 +9793,46 @@ export default function HockeySimGame() {
         t.id === USER_TEAM_ID ? { ...t, scouting: result.newScouting } : t
       );
       return { ...prev, teams: newTeams };
+    });
+  }
+
+  // --- Phase 4: Contract / Re-sign Actions ---
+  function handleReSignPlayer(playerId, offeredAAV, offeredTerm) {
+    setLeagueState(prev => {
+      const userTeam = prev.teams.find(t => t.id === USER_TEAM_ID);
+      if (!userTeam) return prev;
+      const player = userTeam.players.find(p => p.id === playerId);
+      if (!player) return prev;
+
+      const result = attemptReSign(userTeam, player, offeredAAV, offeredTerm);
+      const negotiations = { ...(prev.resignState?.negotiations || {}), [playerId]: result };
+
+      if (!result.accepted) {
+        return { ...prev, resignState: { ...prev.resignState, negotiations } };
+      }
+
+      const newContract = { ...result.contract, yearSigned: prev.currentSeason };
+      const newTeams = prev.teams.map(t => {
+        if (t.id !== USER_TEAM_ID) return t;
+        const newPlayers = t.players.map(p => p.id === playerId ? { ...p, contract: newContract } : p);
+        const updated = { ...t, players: newPlayers };
+        return { ...updated, capState: recalculateCapState(updated) };
+      });
+      const completed = [...(prev.resignState?.completed || []), playerId];
+      return { ...prev, teams: newTeams, resignState: { ...prev.resignState, negotiations, completed } };
+    });
+  }
+
+  function handleBuyoutPlayer(playerId) {
+    setLeagueState(prev => {
+      const userTeam = prev.teams.find(t => t.id === USER_TEAM_ID);
+      if (!userTeam) return prev;
+      const updatedTeam = executeBuyout(userTeam, playerId);
+      const newTeams = prev.teams.map(t => t.id === USER_TEAM_ID ? updatedTeam : t);
+      // Release player to FA pool
+      const boughtOutPlayer = userTeam.players.find(p => p.id === playerId);
+      const newFAs = boughtOutPlayer ? [...prev.freeAgents, { ...boughtOutPlayer, teamId: null, contract: null }] : prev.freeAgents;
+      return { ...prev, teams: newTeams, freeAgents: newFAs };
     });
   }
 
@@ -9547,10 +9911,13 @@ export default function HockeySimGame() {
   function handleStartNewSeason() {
     setLeagueState(prev => {
       // Phase 3: refresh scouting tokens for all teams at new season start
-      const teamsWithRefreshedTokens = prev.teams.map(t => refreshScoutingTokens(t));
+      // Phase 4: progress contracts (decrement years)
+      const teamsAfterContracts = progressContracts(prev.teams, prev.currentSeason);
+      const teamsWithRefreshedTokens = teamsAfterContracts.map(t => refreshScoutingTokens(t));
       return {
         ...prev,
         teams: teamsWithRefreshedTokens,
+        resignState: null,
         currentSeason: prev.currentSeason + 1,
         seasonSimulated: false,
         seasonPhase: 'preseason',
@@ -9640,6 +10007,7 @@ export default function HockeySimGame() {
     { key: 'trades', label: 'Trades', icon: '🔄', locked: mgmtLocked || inOffseason },
     { key: 'freeAgency', label: 'Free Agency', icon: '✍️', locked: mgmtLocked || inOffseason },
     { key: 'scouting', label: 'Scouting', icon: '🔍' },
+    { key: 'contracts', label: 'Contracts', icon: '💰' },
     { key: 'injuries', label: 'Injuries', icon: '🏥' },
     { key: 'awards', label: 'Awards', icon: '🏆', show: seasonSimulated },
     { key: 'playoffs', label: 'Playoffs', icon: '🥊', show: seasonSimulated || playoffs?.active },
@@ -9750,6 +10118,13 @@ export default function HockeySimGame() {
             onScoutFA={handleScoutFA}
           />
         )}
+        {currentView === 'contracts' && (
+          <CapDashboardView
+            teams={teams}
+            userTeamId={USER_TEAM_ID}
+            onBuyout={handleBuyoutPlayer}
+          />
+        )}
         {currentView === 'injuries' && <InjuryReportView teams={teams} />}
         {currentView === 'awards' && (
           <AwardsCeremonyView
@@ -9812,6 +10187,9 @@ export default function HockeySimGame() {
             onRelease={handleRelease}
             onStartNewSeason={handleStartNewSeason}
             userTeamScouting={teams.find(t => t.id === USER_TEAM_ID)?.scouting}
+            resignState={resignState}
+            onReSign={handleReSignPlayer}
+            onBuyout={handleBuyoutPlayer}
           />
         )}
       </main>
