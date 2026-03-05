@@ -344,6 +344,7 @@ function generatePlayer(position, role, targetOvr, lineNumber, isExtra, teamId, 
     careerPlayoffStats: makeEmptySeasonStats(isGoalie),
     seasonHistory: [],
     draftedSeason: null, draftedRound: null, draftedPick: null, draftedBy: null,
+    contract: generateContract({ overall, age }),
   };
 }
 
@@ -407,14 +408,17 @@ function generateTeam(teamDef, usedNames) {
     dayToDay: [],
     strategy: null, // set after generation
     scouting: initTeamScouting(isUserTeam ? null : assignAIScoutingTier()),
+    capState: null,  // computed after generation
   };
   teamObj.strategy = buildDefaultStrategy(teamObj);
+  teamObj.capState = recalculateCapState(teamObj);
   return teamObj;
 }
 
 function generateLeague() {
   const usedNames = new Set();
-  const teams = TEAM_DEFS.map(def => generateTeam(def, usedNames));
+  const rawTeams = TEAM_DEFS.map(def => generateTeam(def, usedNames));
+  const teams = rawTeams.map(t => balanceTeamCap(t));
   const freeAgents = generateFreeAgents(usedNames);
   return { teams, freeAgents };
 }
@@ -434,7 +438,8 @@ function generateFreeAgents(usedNames) {
     const role = pickRole(pos);
     const targetOvr = randInt(65, 82);
     const line = targetOvr >= 78 ? 2 : targetOvr >= 74 ? 3 : 4;
-    return generatePlayer(pos, role, targetOvr, line, false, null, usedNames);
+    const p = generatePlayer(pos, role, targetOvr, line, false, null, usedNames);
+    return { ...p, contract: generateContract(p) };
   });
 }
 
@@ -497,6 +502,551 @@ function getDefensePairChemistry(p1, p2) {
   }
   return 1.0;
 }
+// ============================================================
+// PHASE 4 — CONTRACTS & SALARY CAP CONSTANTS
+// ============================================================
+
+const CAP_CONFIG = {
+  salaryCap:             82500000,
+  elcMaxAAV:             950000,
+  elcTerm:               3,
+  minAAV:                775000,
+  maxAAV:                16000000,
+  buyoutCostMultiplier:  2 / 3,
+  buyoutYearsMultiplier: 2,
+  maxBuyoutsPerSeason:   2,
+  maxRetainedContracts:  2,
+  maxRetentionPct:       50,
+  retentionIncrements:   10,
+  minRosterSize:         20,
+  maxRosterSize:         23,
+  // OVR → base AAV table (13 tiers)
+  ovrToBaseAAV: [
+    { minOvr: 90, aav: 10000000 },
+    { minOvr: 87, aav:  8000000 },
+    { minOvr: 84, aav:  6500000 },
+    { minOvr: 81, aav:  5200000 },
+    { minOvr: 78, aav:  4100000 },
+    { minOvr: 75, aav:  3200000 },
+    { minOvr: 72, aav:  2500000 },
+    { minOvr: 70, aav:  2000000 },
+    { minOvr: 68, aav:  1600000 },
+    { minOvr: 66, aav:  1300000 },
+    { minOvr: 64, aav:  1050000 },
+    { minOvr: 62, aav:   875000 },
+    { minOvr:  0, aav:   775000 },
+  ],
+  // Age multiplier table
+  ageMultipliers: [
+    { maxAge: 21, mult: 0.20 },   // ELC territory
+    { maxAge: 22, mult: 0.55 },
+    { maxAge: 23, mult: 0.75 },
+    { maxAge: 24, mult: 0.90 },
+    { maxAge: 30, mult: 1.00 },   // prime years
+    { maxAge: 32, mult: 0.92 },
+    { maxAge: 34, mult: 0.80 },
+    { maxAge: 36, mult: 0.60 },
+    { maxAge: 99, mult: 0.35 },
+  ],
+};
+
+const CONTRACT_TYPES = {
+  ELC:       { label: 'Entry-Level',    color: '#22c55e',  maxTerm: 3 },
+  STANDARD:  { label: 'Standard',       color: '#3b82f6',  maxTerm: 7 },
+  VETERAN:   { label: 'Veteran',        color: '#a78bfa',  maxTerm: 4 },
+  BUYOUT:    { label: 'Buyout',         color: '#f97316',  maxTerm: 0 },
+  RETAINED:  { label: 'Retained',       color: '#f59e0b',  maxTerm: 0 },
+};
+
+// ============================================================
+// CONTRACT GENERATION FUNCTIONS
+// ============================================================
+
+function formatSalary(aav) {
+  if (!aav && aav !== 0) return '$0';
+  if (aav >= 1000000) return `$${(aav / 1000000).toFixed(2)}M`;
+  return `$${Math.round(aav / 1000)}K`;
+}
+
+function calculateMarketAAV(ovr) {
+  const tier = CAP_CONFIG.ovrToBaseAAV.find(t => ovr >= t.minOvr);
+  return tier ? tier.aav : CAP_CONFIG.minAAV;
+}
+
+function getAgeAAVMultiplier(age) {
+  const entry = CAP_CONFIG.ageMultipliers.find(e => age <= e.maxAge);
+  return entry ? entry.mult : 0.35;
+}
+
+function calculateContractTerm(ovr, age) {
+  if (age <= 21) return CAP_CONFIG.elcTerm;
+  if (age >= 35) return 1;
+  if (age >= 32) return Math.min(2, Math.floor((36 - age)));
+  if (ovr >= 87) return randInt(5, 7);
+  if (ovr >= 80) return randInt(3, 5);
+  if (ovr >= 73) return randInt(2, 4);
+  return randInt(1, 2);
+}
+
+function generateContract(player, overrideAAV, overrideTerm) {
+  const { overall: ovr, age } = player;
+  const isELC = age <= 21;
+
+  let aav, term, type;
+
+  if (isELC) {
+    aav  = Math.min(CAP_CONFIG.elcMaxAAV, calculateMarketAAV(ovr));
+    term = CAP_CONFIG.elcTerm;
+    type = 'ELC';
+  } else {
+    const baseAAV  = calculateMarketAAV(ovr);
+    const ageMult  = getAgeAAVMultiplier(age);
+    aav  = overrideAAV  !== undefined ? overrideAAV  : Math.max(CAP_CONFIG.minAAV, Math.round(baseAAV * ageMult));
+    term = overrideTerm !== undefined ? overrideTerm : calculateContractTerm(ovr, age);
+    type = age >= 35 ? 'VETERAN' : 'STANDARD';
+  }
+
+  aav = clamp(aav, CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV);
+
+  return {
+    aav,
+    yearsRemaining: term,
+    totalYears:     term,
+    yearSigned:     0,                     // set to currentSeason at sign time
+    type,
+    status:         'active',
+    isExpiring:     term === 1,
+    buyout:         null,
+  };
+}
+
+function generateELCContract(season) {
+  return {
+    aav:            CAP_CONFIG.elcMaxAAV,
+    yearsRemaining: CAP_CONFIG.elcTerm,
+    totalYears:     CAP_CONFIG.elcTerm,
+    yearSigned:     season,
+    type:           'ELC',
+    status:         'active',
+    isExpiring:     false,
+    buyout:         null,
+  };
+}
+
+
+// ============================================================
+// CAP MANAGEMENT ENGINE
+// ============================================================
+
+function recalculateCapState(team) {
+  const players = team.players || [];
+  let activePayroll = 0;
+  let deadCap = 0;
+  const expiringContracts = [];
+  const retainedSalary = team.capState?.retainedSalary || [];
+  const buyoutContracts = team.capState?.buyoutContracts || [];
+
+  for (const p of players) {
+    const c = p.contract;
+    if (!c || c.status === 'buyout') continue;
+    activePayroll += c.aav || 0;
+    if (c.isExpiring || c.yearsRemaining === 1) {
+      expiringContracts.push({ playerId: p.id, name: `${p.firstName} ${p.lastName}`, aav: c.aav, position: p.position, ovr: p.overall });
+    }
+  }
+
+  // Dead cap from buyouts and retained salary
+  for (const bc of buyoutContracts) {
+    deadCap += bc.annualHit || 0;
+  }
+  for (const rs of retainedSalary) {
+    // Retained salary is already deducted from original trade, add to dead cap tracking
+    deadCap += rs.annualHit || 0;
+  }
+
+  const totalCapHit     = activePayroll + deadCap;
+  const capSpace        = CAP_CONFIG.salaryCap - totalCapHit;
+  const projectedPayroll = players.filter(p => p.contract && p.contract.yearsRemaining > 1).reduce((s, p) => s + (p.contract?.aav || 0), 0);
+
+  return {
+    salaryCap:        CAP_CONFIG.salaryCap,
+    activePayroll,
+    deadCap,
+    totalCapHit,
+    capSpace,
+    retainedSalary,
+    buyoutContracts,
+    expiringContracts,
+    projectedPayroll,
+    projectedCapSpace: CAP_CONFIG.salaryCap - projectedPayroll,
+  };
+}
+
+function isCapCompliant(team) {
+  const cs = recalculateCapState(team);
+  return cs.totalCapHit <= CAP_CONFIG.salaryCap;
+}
+
+function canSignPlayer(team, playerAAV) {
+  const cs = recalculateCapState(team);
+  return cs.capSpace >= playerAAV;
+}
+
+function balanceTeamCap(team) {
+  // Iteratively reduce the most overpaid contracts until cap-compliant
+  let t = { ...team, players: team.players.map(p => ({ ...p })) };
+  let iterations = 0;
+
+  while (!isCapCompliant(t) && iterations < 30) {
+    iterations++;
+    const cs = recalculateCapState(t);
+    const overage = cs.totalCapHit - CAP_CONFIG.salaryCap;
+
+    // Find most overpaid player (highest AAV, non-ELC)
+    const overpaid = t.players
+      .filter(p => p.contract && p.contract.type !== 'ELC' && p.contract.aav > CAP_CONFIG.minAAV)
+      .sort((a, b) => (b.contract?.aav || 0) - (a.contract?.aav || 0));
+
+    if (overpaid.length === 0) break;
+    const target = overpaid[0];
+    const reduction = Math.min(overage + 100000, target.contract.aav - CAP_CONFIG.minAAV);
+    target.contract = { ...target.contract, aav: Math.max(CAP_CONFIG.minAAV, target.contract.aav - reduction) };
+  }
+
+  t.capState = recalculateCapState(t);
+  return t;
+}
+
+function progressContracts(teams, currentSeason) {
+  return teams.map(team => {
+    const players = team.players.map(p => {
+      if (!p.contract) return p;
+      const yearsRemaining = p.contract.yearsRemaining - 1;
+      return {
+        ...p,
+        contract: {
+          ...p.contract,
+          yearsRemaining,
+          isExpiring: yearsRemaining <= 1,
+          status: yearsRemaining <= 0 ? 'expired' : 'active',
+        }
+      };
+    });
+
+    // Progress buyout contracts
+    const buyoutContracts = (team.capState?.buyoutContracts || [])
+      .map(bc => ({ ...bc, yearsRemaining: bc.yearsRemaining - 1 }))
+      .filter(bc => bc.yearsRemaining > 0);
+
+    const updatedTeam = { ...team, players, capState: { ...(team.capState || {}), buyoutContracts } };
+    updatedTeam.capState = recalculateCapState(updatedTeam);
+    return updatedTeam;
+  });
+}
+
+// ============================================================
+// PLAYER DEMAND & NEGOTIATION
+// ============================================================
+
+function calculatePerformanceModifier(player) {
+  const stats = player.seasonStats || {};
+  const isGoalie = player.position === 'G';
+  if (isGoalie) {
+    const svPct = stats.SA > 0 ? stats.SV / stats.SA : 0.900;
+    const winsPerGame = stats.GP > 0 ? (stats.W || 0) / stats.GP : 0.5;
+    if (svPct >= 0.930 && winsPerGame >= 0.6) return 1.15;
+    if (svPct >= 0.915 && winsPerGame >= 0.5) return 1.05;
+    if (svPct < 0.880 || winsPerGame < 0.35) return 0.85;
+    return 1.00;
+  }
+  const pts = (stats.G || 0) + (stats.A || 0);
+  const ptsPG = stats.GP > 0 ? pts / stats.GP : 0;
+  if (ptsPG >= 1.2) return 1.18;
+  if (ptsPG >= 0.9) return 1.08;
+  if (ptsPG >= 0.6) return 1.02;
+  if (ptsPG < 0.3)  return 0.88;
+  return 1.00;
+}
+
+function calculatePlayerDemands(player, teamNeed = 1.0) {
+  const baseAAV  = calculateMarketAAV(player.overall);
+  const ageMult  = getAgeAAVMultiplier(player.age);
+  const perfMod  = calculatePerformanceModifier(player);
+  const needMod  = teamNeed;             // 1.0–1.2 based on how badly team needs player
+
+  const demandAAV  = Math.round(baseAAV * ageMult * perfMod * needMod);
+  const demandTerm = calculateContractTerm(player.overall, player.age);
+  const minAcceptAAV = Math.round(demandAAV * 0.82);
+
+  return {
+    demandAAV:    clamp(demandAAV, CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV),
+    demandTerm,
+    minAcceptAAV: clamp(minAcceptAAV, CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV),
+    willingness:  Math.min(1.0, 0.5 + (player.overall < 75 ? 0.3 : 0) + (player.age > 33 ? 0.2 : 0)),
+  };
+}
+
+function calculateAcceptanceProbability(offeredAAV, demandAAV, minAcceptAAV) {
+  if (offeredAAV >= demandAAV)    return 1.0;
+  if (offeredAAV < minAcceptAAV)  return 0.0;
+  const range  = demandAAV - minAcceptAAV;
+  const above  = offeredAAV - minAcceptAAV;
+  return Math.pow(above / range, 1.5);
+}
+
+function attemptReSign(team, player, offeredAAV, offeredTerm) {
+  const demand = calculatePlayerDemands(player, 1.0);
+  const prob   = calculateAcceptanceProbability(offeredAAV, demand.demandAAV, demand.minAcceptAAV);
+  const roll   = Math.random();
+  const accepted = roll < prob;
+
+  if (!accepted) return { accepted: false, demand };
+
+  if (!canSignPlayer(team, offeredAAV)) return { accepted: false, demand, reason: 'Cap space insufficient' };
+
+  const contract = {
+    aav:            offeredAAV,
+    yearsRemaining: offeredTerm,
+    totalYears:     offeredTerm,
+    yearSigned:     0,
+    type:           player.age <= 21 ? 'ELC' : player.age >= 35 ? 'VETERAN' : 'STANDARD',
+    status:         'active',
+    isExpiring:     offeredTerm === 1,
+    buyout:         null,
+  };
+
+  return { accepted: true, contract, demand };
+}
+
+// ============================================================
+// FREE AGENCY
+// ============================================================
+
+function calculateFADemands(player) {
+  const base      = calculatePlayerDemands(player, 1.0);
+  const faPremium = 1.0 + randFloat(0.05, 0.15);  // 5–15% FA premium
+  return {
+    demandAAV:    clamp(Math.round(base.demandAAV * faPremium), CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV),
+    demandTerm:   base.demandTerm,
+    minAcceptAAV: clamp(Math.round(base.minAcceptAAV * faPremium), CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV),
+    willingness:  base.willingness,
+    faPremium,
+  };
+}
+
+function signFreeAgent(team, player, overrideAAV, overrideTerm) {
+  const aav  = overrideAAV  !== undefined ? overrideAAV  : calculateFADemands(player).demandAAV;
+  const term = overrideTerm !== undefined ? overrideTerm : calculateContractTerm(player.overall, player.age);
+  const type = player.age <= 21 ? 'ELC' : player.age >= 35 ? 'VETERAN' : 'STANDARD';
+
+  const contract = {
+    aav:            clamp(aav, CAP_CONFIG.minAAV, CAP_CONFIG.maxAAV),
+    yearsRemaining: term,
+    totalYears:     term,
+    yearSigned:     0,
+    type,
+    status:         'active',
+    isExpiring:     term === 1,
+    buyout:         null,
+  };
+
+  return { ...player, teamId: team.id, contract, isExtra: true, lineNumber: 4, rosterStatus: 'extra' };
+}
+
+// ============================================================
+// TRADE SALARY VALIDATION
+// ============================================================
+
+function validateTradeSalary(teamA, teamB, playersA, playersB) {
+  // Both teams must stay cap-compliant after trade
+  const salaryOut_A = playersA.reduce((s, p) => s + (p.contract?.aav || 0), 0);
+  const salaryIn_A  = playersB.reduce((s, p) => s + (p.contract?.aav || 0), 0);
+  const salaryOut_B = playersB.reduce((s, p) => s + (p.contract?.aav || 0), 0);
+  const salaryIn_B  = playersA.reduce((s, p) => s + (p.contract?.aav || 0), 0);
+
+  const csA = recalculateCapState(teamA);
+  const csB = recalculateCapState(teamB);
+
+  const newHitA = csA.totalCapHit - salaryOut_A + salaryIn_A;
+  const newHitB = csB.totalCapHit - salaryOut_B + salaryIn_B;
+
+  return {
+    teamACompliant: newHitA <= CAP_CONFIG.salaryCap,
+    teamBCompliant: newHitB <= CAP_CONFIG.salaryCap,
+    teamANewHit:    newHitA,
+    teamBNewHit:    newHitB,
+    valid:          newHitA <= CAP_CONFIG.salaryCap && newHitB <= CAP_CONFIG.salaryCap,
+  };
+}
+
+function getTradeCapSummary(team, outPlayers, inPlayers) {
+  const cs         = recalculateCapState(team);
+  const salaryOut  = outPlayers.reduce((s, p) => s + (p.contract?.aav || 0), 0);
+  const salaryIn   = inPlayers.reduce((s, p)  => s + (p.contract?.aav || 0), 0);
+  const newCapHit  = cs.totalCapHit - salaryOut + salaryIn;
+  return {
+    currentHit:   cs.totalCapHit,
+    newHit:       newCapHit,
+    capSpace:     CAP_CONFIG.salaryCap - newCapHit,
+    salaryDelta:  salaryIn - salaryOut,
+    compliant:    newCapHit <= CAP_CONFIG.salaryCap,
+  };
+}
+
+// ============================================================
+// BUYOUTS
+// ============================================================
+
+function calculateBuyout(player) {
+  const c = player.contract;
+  if (!c || c.yearsRemaining <= 0) return null;
+
+  const remainingValue  = c.aav * c.yearsRemaining;
+  const buyoutCost      = Math.round(remainingValue * CAP_CONFIG.buyoutCostMultiplier);
+  const buyoutYears     = c.yearsRemaining * CAP_CONFIG.buyoutYearsMultiplier;
+  const annualHit       = Math.round(buyoutCost / buyoutYears);
+
+  return {
+    playerId:      player.id,
+    playerName:    `${player.firstName} ${player.lastName}`,
+    remainingValue,
+    buyoutCost,
+    buyoutYears,
+    annualHit,
+    yearsRemaining: buyoutYears,
+    originalAAV:   c.aav,
+  };
+}
+
+function executeBuyout(team, playerId) {
+  const player = team.players.find(p => p.id === playerId);
+  if (!player) return team;
+
+  const buyoutInfo = calculateBuyout(player);
+  if (!buyoutInfo) return team;
+
+  const existingBuyouts = team.capState?.buyoutContracts || [];
+  if (existingBuyouts.length >= CAP_CONFIG.maxBuyoutsPerSeason) return team;
+
+  const newPlayers       = team.players.filter(p => p.id !== playerId);
+  const newBuyoutRecord  = { ...buyoutInfo, yearExecuted: 0 };
+  const newBuyouts       = [...existingBuyouts, newBuyoutRecord];
+
+  const updatedTeam = {
+    ...team,
+    players:  newPlayers,
+    capState: { ...(team.capState || {}), buyoutContracts: newBuyouts },
+  };
+  updatedTeam.capState = recalculateCapState(updatedTeam);
+  return updatedTeam;
+}
+
+// ============================================================
+// AI GM CONTRACT LOGIC
+// ============================================================
+
+function calculateReSignPriority(player, team) {
+  const isUserTeam = team.id === USER_TEAM_ID;
+  const c = player.contract;
+  if (!c || c.yearsRemaining > 1) return 0;  // Not expiring
+
+  let priority = player.overall * 0.8;
+  if (player.position === 'G' && player.lineNumber === 1) priority += 10;
+  if (player.lineNumber === 1) priority += 15;
+  priority += Math.max(0, 30 - player.age) * 0.5;
+
+  return priority;
+}
+
+function aiReSignPlayers(team, currentSeason) {
+  let t = { ...team, players: [...team.players] };
+  const expiring = t.players.filter(p => p.contract && (p.contract.yearsRemaining <= 1 || p.contract.status === 'expired'));
+
+  // Sort by priority
+  const prioritized = expiring.map(p => ({ player: p, priority: calculateReSignPriority(p, t) }))
+    .sort((a, b) => b.priority - a.priority);
+
+  for (const { player: p } of prioritized) {
+    const cs = recalculateCapState(t);
+    if (cs.capSpace < CAP_CONFIG.minAAV) break;
+
+    const demand = calculatePlayerDemands(p, 1.0);
+    const offeredAAV  = Math.min(demand.demandAAV, cs.capSpace);
+    const offeredTerm = calculateContractTerm(p.overall, p.age);
+
+    if (offeredAAV < demand.minAcceptAAV) continue;  // Can't afford what player wants
+
+    const newContract = {
+      aav:            offeredAAV,
+      yearsRemaining: offeredTerm,
+      totalYears:     offeredTerm,
+      yearSigned:     currentSeason,
+      type:           p.age <= 21 ? 'ELC' : p.age >= 35 ? 'VETERAN' : 'STANDARD',
+      status:         'active',
+      isExpiring:     offeredTerm === 1,
+      buyout:         null,
+    };
+    t = { ...t, players: t.players.map(pl => pl.id === p.id ? { ...pl, contract: newContract } : pl) };
+  }
+
+  t.capState = recalculateCapState(t);
+  return t;
+}
+
+function aiSignFreeAgents(team, freeAgents, currentSeason) {
+  let t = { ...team };
+  let fas = [...freeAgents];
+  const MAX_PLAYERS = CAP_CONFIG.maxRosterSize;
+
+  while (t.players.length < MAX_PLAYERS && fas.length > 0) {
+    const cs = recalculateCapState(t);
+    if (cs.capSpace < CAP_CONFIG.minAAV * 2) break;
+
+    // Pick best available FA within budget
+    const affordable = fas.filter(p => {
+      const demand = calculateFADemands(p);
+      return demand.demandAAV <= cs.capSpace;
+    }).sort((a, b) => b.overall - a.overall);
+
+    if (affordable.length === 0) break;
+
+    const target  = affordable[0];
+    const demand  = calculateFADemands(target);
+    const signed  = signFreeAgent(t, target, Math.min(demand.demandAAV, cs.capSpace - 100000), demand.demandTerm);
+    signed.contract.yearSigned = currentSeason;
+
+    t   = { ...t, players: [...t.players, signed] };
+    fas = fas.filter(p => p.id !== target.id);
+  }
+
+  t.capState = recalculateCapState(t);
+  return { team: t, remainingFAs: fas };
+}
+
+function aiConsiderBuyouts(team) {
+  const existingBuyouts = team.capState?.buyoutContracts || [];
+  if (existingBuyouts.length >= CAP_CONFIG.maxBuyoutsPerSeason) return team;
+  if (isCapCompliant(team)) return team;
+
+  let t = { ...team };
+  const cs = recalculateCapState(t);
+  const overage = cs.totalCapHit - CAP_CONFIG.salaryCap;
+
+  // Find worst value contracts to buy out
+  const candidates = t.players
+    .filter(p => p.contract && p.contract.type !== 'ELC' && p.contract.yearsRemaining >= 2 && p.overall < 72)
+    .sort((a, b) => (a.overall / (a.contract?.aav || 1)) - (b.overall / (b.contract?.aav || 1)));
+
+  for (const c of candidates) {
+    if (isCapCompliant(t)) break;
+    if ((t.capState?.buyoutContracts || []).length >= CAP_CONFIG.maxBuyoutsPerSeason) break;
+    t = executeBuyout(t, c.id);
+  }
+
+  return t;
+}
+
+
 // ============================================================
 // PHASE 3 — SCOUTING SYSTEM CONSTANTS
 // ============================================================
@@ -8964,8 +9514,14 @@ export default function HockeySimGame() {
       };
 
       // Add prospect to team
-      const draftedProspect = { ...pickedProspect, teamId: currentPick.teamId, draftedBy: currentPick.teamId, isExtra: true, lineNumber: 4, rosterStatus: 'extra' };
-      const newTeams = teams.map(t => t.id === currentPick.teamId ? { ...t, players: [...t.players, draftedProspect] } : t);
+      const elcContract = generateELCContract(prev.currentSeason);
+      const draftedProspect = { ...pickedProspect, teamId: currentPick.teamId, draftedBy: currentPick.teamId, isExtra: true, lineNumber: 4, rosterStatus: 'extra', contract: elcContract, draftedSeason: prev.currentSeason, draftedRound: currentPick.round, draftedPick: currentPick.pick };
+      const draftTeamUpdated = teams.find(t => t.id === currentPick.teamId);
+      const newTeams = teams.map(t => {
+        if (t.id !== currentPick.teamId) return t;
+        const updated = { ...t, players: [...t.players, draftedProspect] };
+        return { ...updated, capState: recalculateCapState(updated) };
+      });
 
       const newDraftHistory = [...draftState.draftHistory, pickRecord];
       const nextPickIndex = draftState.currentPickIndex + 1;
@@ -9041,7 +9597,9 @@ export default function HockeySimGame() {
       const newTeams = prev.teams.map(t => {
         if (t.id !== teamId) return t;
         if (t.players.filter(p => !p.injury?.active || (p.injury?.gamesTotal||0) < 5).length >= 23) return t;
-        return { ...t, players: [...t.players, { ...fa, teamId, isExtra: true, lineNumber: 4, rosterStatus: 'extra' }] };
+        const faContract = fa.contract || generateContract(fa);
+        const signedPlayer = signFreeAgent(t, fa, faContract.aav, faContract.yearsRemaining);
+        return { ...t, players: [...t.players, signedPlayer], capState: recalculateCapState({ ...t, players: [...t.players, signedPlayer] }) };
       });
       return { ...prev, teams: newTeams, freeAgents: newFAs };
     });
@@ -9054,7 +9612,8 @@ export default function HockeySimGame() {
       const player = team.players.find(p => p.id === playerId);
       if (!player) return prev;
       const newTeams = prev.teams.map(t => t.id !== teamId ? t : { ...t, players: t.players.filter(p => p.id !== playerId) });
-      return { ...prev, teams: newTeams, freeAgents: [...prev.freeAgents, { ...player, teamId: null, isExtra: false }] };
+      const newTeamsWithCap = newTeams.map(t => t.id === teamId ? { ...t, capState: recalculateCapState(t) } : t);
+      return { ...prev, teams: newTeamsWithCap, freeAgents: [...prev.freeAgents, { ...player, teamId: null, isExtra: false }] };
     });
   }
 
