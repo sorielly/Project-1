@@ -397,6 +397,7 @@ function generateTeam(teamDef, usedNames) {
     const p = generatePlayer(slot.pos, role, targetOvr, slot.line, slot.isExtra, teamDef.id, usedNames);
     players.push(p);
   }
+  const isUserTeam = teamDef.id === 'BLZ';
   const teamObj = {
     ...teamDef,
     players,
@@ -405,6 +406,7 @@ function generateTeam(teamDef, usedNames) {
     injuredReserve: [],
     dayToDay: [],
     strategy: null, // set after generation
+    scouting: initTeamScouting(isUserTeam ? null : assignAIScoutingTier()),
   };
   teamObj.strategy = buildDefaultStrategy(teamObj);
   return teamObj;
@@ -495,6 +497,117 @@ function getDefensePairChemistry(p1, p2) {
   }
   return 1.0;
 }
+// ============================================================
+// PHASE 3 — SCOUTING SYSTEM CONSTANTS
+// ============================================================
+
+const SCOUTING_CONFIG = {
+  tokensPerSeason: 30,
+  tokenCosts:          { basic: 1, detailed: 2, elite: 3 },
+  cumulativeCost:      { 1: 1, 2: 3, 3: 6 },
+  freeAgentCumulativeCost: { 1: 1, 2: 2, 3: 4 },
+  noiseLevels:         { 0: 0.30, 1: 0.18, 2: 0.10, 3: 0.03 },
+  ovrRangeWidth:       { 0: 14, 1: 8, 2: 4, 3: 1 },
+  potentialVisibility: { 0: 'hidden', 1: 'range', 2: 'approximate', 3: 'exact' },
+  attributeVisibility: { 0: 0, 1: 4, 2: 13, 3: 99 },
+  aiScoutingTiers: {
+    poor:    { noiseLevel: 0.22, potentialAccuracy: 0.55, budgetMultiplier: 0.6 },
+    average: { noiseLevel: 0.15, potentialAccuracy: 0.72, budgetMultiplier: 1.0 },
+    good:    { noiseLevel: 0.10, potentialAccuracy: 0.85, budgetMultiplier: 1.2 },
+    elite:   { noiseLevel: 0.05, potentialAccuracy: 0.95, budgetMultiplier: 1.5 },
+  },
+  confidenceLabels: ['Unscouted', 'Basic Scout', 'Detailed Scout', 'Elite Scout'],
+  confidenceIcons:  ['❓', '🔍', '📋', '🎯'],
+  confidenceColors: ['#4a5568', '#ed8936', '#5b9bd5', '#2ed573'],
+};
+
+// Per-role attribute priority lists (most important first, 25 skater attrs)
+const ROLE_KEY_ATTRIBUTES = {
+  'Sniper': [
+    'wristShotAccuracy','slapShotAccuracy','slapShotPower','offensiveAwareness',
+    'speed','puckControl','handEye','wristShotPower','acceleration','agility',
+    'passing','balance','defensiveAwareness','stickChecking','endurance','strength',
+    'shotBlocking','bodyChecking','faceoffs','discipline','durability','aggression',
+    'fighting','poise','deking',
+  ],
+  'Playmaker': [
+    'passing','offensiveAwareness','puckControl','speed','agility','deking',
+    'acceleration','wristShotAccuracy','handEye','balance','endurance','faceoffs',
+    'defensiveAwareness','stickChecking','discipline','slapShotAccuracy','strength',
+    'bodyChecking','shotBlocking','durability','slapShotPower','wristShotPower',
+    'aggression','fighting','poise',
+  ],
+  'Power Forward': [
+    'strength','bodyChecking','wristShotAccuracy','balance','offensiveAwareness',
+    'puckControl','speed','handEye','aggression','slapShotPower','endurance','durability',
+    'acceleration','defensiveAwareness','passing','stickChecking','slapShotAccuracy',
+    'agility','deking','shotBlocking','faceoffs','discipline','fighting','wristShotPower','poise',
+  ],
+  'Two-Way Forward': [
+    'defensiveAwareness','offensiveAwareness','speed','stickChecking','faceoffs',
+    'passing','puckControl','endurance','wristShotAccuracy','acceleration','discipline',
+    'agility','shotBlocking','bodyChecking','balance','handEye','strength','durability',
+    'slapShotAccuracy','deking','slapShotPower','aggression','wristShotPower','fighting','poise',
+  ],
+  'Grinder': [
+    'bodyChecking','endurance','speed','defensiveAwareness','strength','aggression',
+    'stickChecking','discipline','balance','durability','shotBlocking','faceoffs',
+    'acceleration','offensiveAwareness','puckControl','passing','agility','wristShotAccuracy',
+    'handEye','slapShotPower','deking','slapShotAccuracy','wristShotPower','fighting','poise',
+  ],
+  'Enforcer': [
+    'fighting','strength','bodyChecking','aggression','durability','balance','endurance',
+    'speed','defensiveAwareness','stickChecking','acceleration','discipline','shotBlocking',
+    'offensiveAwareness','puckControl','wristShotAccuracy','passing','agility','handEye',
+    'faceoffs','slapShotAccuracy','deking','slapShotPower','wristShotPower','poise',
+  ],
+  'Offensive Defenseman': [
+    'slapShotAccuracy','slapShotPower','offensiveAwareness','passing','puckControl',
+    'speed','wristShotAccuracy','agility','acceleration','defensiveAwareness','stickChecking',
+    'deking','handEye','balance','endurance','bodyChecking','shotBlocking','strength',
+    'discipline','durability','faceoffs','aggression','wristShotPower','fighting','poise',
+  ],
+  'Defensive Defenseman': [
+    'defensiveAwareness','stickChecking','shotBlocking','bodyChecking','strength','balance',
+    'endurance','discipline','speed','acceleration','durability','passing','puckControl',
+    'agility','offensiveAwareness','slapShotAccuracy','slapShotPower','handEye','faceoffs',
+    'wristShotAccuracy','deking','aggression','wristShotPower','fighting','poise',
+  ],
+  'Two-Way Defenseman': [
+    'defensiveAwareness','passing','stickChecking','speed','offensiveAwareness','puckControl',
+    'slapShotAccuracy','acceleration','bodyChecking','balance','agility','endurance',
+    'shotBlocking','strength','slapShotPower','discipline','durability','handEye',
+    'wristShotAccuracy','deking','faceoffs','aggression','wristShotPower','fighting','poise',
+  ],
+  'Enforcer Defenseman': [
+    'bodyChecking','fighting','strength','defensiveAwareness','stickChecking','aggression',
+    'balance','durability','shotBlocking','endurance','speed','acceleration','discipline',
+    'passing','puckControl','offensiveAwareness','agility','slapShotAccuracy','slapShotPower',
+    'handEye','wristShotAccuracy','deking','wristShotPower','faceoffs','poise',
+  ],
+  // Goalie roles (11 goalie attributes)
+  'Butterfly': [
+    'reflexes','positioning','consistency','reboundControl','gloveLow','gloveHigh',
+    'stickLow','stickHigh','fiveHole','puckHandling','recovery',
+  ],
+  'Hybrid': [
+    'positioning','reflexes','reboundControl','consistency','gloveHigh','gloveLow',
+    'stickHigh','stickLow','fiveHole','recovery','puckHandling',
+  ],
+  'Stand Up': [
+    'positioning','stickHigh','stickLow','reflexes','consistency','reboundControl',
+    'gloveHigh','gloveLow','fiveHole','recovery','puckHandling',
+  ],
+};
+
+// Fallback for unknown roles
+const DEFAULT_ROLE_KEY_ATTRIBUTES = [
+  'speed','offensiveAwareness','defensiveAwareness','passing','puckControl',
+  'wristShotAccuracy','stickChecking','endurance','strength','balance','agility',
+  'acceleration','slapShotAccuracy',
+];
+
+
 
 // ============================================================
 // PHASE 9C-D — DAY-BY-DAY SEASON SIM & GAME RECAPS
@@ -5512,6 +5625,428 @@ function generateDraftClass(season, usedNames) {
   return _.orderBy(prospects, p => p.centralRank);
 }
 
+// ============================================================
+// PHASE 3 — SCOUTING ENGINE
+// ============================================================
+
+// ---- Seeded deterministic random (consistent noise per player+level) ----
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash);
+}
+
+function seededRandom(seed) {
+  let t = seed + 0x6D2B79F5;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+// ---- Attribute key selection ----
+function getRoleKeyAttributeList(role) {
+  return ROLE_KEY_ATTRIBUTES[role] || DEFAULT_ROLE_KEY_ATTRIBUTES;
+}
+
+function getVisibleAttributeKeys(player, scoutLevel) {
+  const allKeys = Object.keys(player.attributes || player.trueAttributes || {});
+  const roleKeys = getRoleKeyAttributeList(player.role);
+  // Filter to only keys that actually exist on this player
+  const orderedKeys = [...roleKeys.filter(k => allKeys.includes(k)),
+                       ...allKeys.filter(k => !roleKeys.includes(k))];
+
+  const maxCount = SCOUTING_CONFIG.attributeVisibility[scoutLevel] ?? 0;
+  if (maxCount === 0) return [];
+  if (maxCount >= 99) return allKeys;
+  return orderedKeys.slice(0, maxCount);
+}
+
+// ---- Visible attributes with seeded noise ----
+function getVisibleAttributes(player, scoutLevel) {
+  if (scoutLevel <= 0) return {};
+  const trueAttrs = player.attributes || player.trueAttributes || {};
+  const noise = SCOUTING_CONFIG.noiseLevels[scoutLevel] || 0.30;
+  const keys = getVisibleAttributeKeys(player, scoutLevel);
+  const visible = {};
+  for (const key of keys) {
+    const trueVal = trueAttrs[key];
+    if (trueVal === undefined) continue;
+    const seed = hashString(`${player.id}_${key}_${scoutLevel}`);
+    const noiseOffset = (seededRandom(seed) * 2 - 1);
+    const noisyVal = Math.round(trueVal + noiseOffset * noise * 60);
+    visible[key] = Math.max(1, Math.min(99, noisyVal));
+  }
+  return visible;
+}
+
+// ---- Visible OVR with range ----
+function getVisibleOVR(player, scoutLevel) {
+  const trueOVR = player.overall || player.trueOverall || 70;
+  const rangeWidth = SCOUTING_CONFIG.ovrRangeWidth[scoutLevel] ?? 14;
+  const seed = hashString(`${player.id}_ovr_${scoutLevel}`);
+  const offset = Math.round((seededRandom(seed) * 2 - 1) * (rangeWidth / 2));
+  const visibleOVR = Math.max(40, Math.min(99, trueOVR + offset));
+  const rangeMin = Math.max(40, trueOVR - Math.floor(rangeWidth / 2));
+  const rangeMax = Math.min(99, trueOVR + Math.ceil(rangeWidth / 2));
+  return {
+    estimate: visibleOVR,
+    range: { min: rangeMin, max: rangeMax },
+    isExact: scoutLevel >= 3,
+  };
+}
+
+// ---- Visible potential ----
+function getVisiblePotential(player, scoutLevel) {
+  const TIERS = ['Franchise','Elite','Top 6','Top 9','Bottom 6','AHL'];
+  // truePotential may be a label string or a number — handle both
+  let truePotential = player.truePotential || player.potential;
+  if (typeof truePotential === 'number') {
+    // Map numeric potential to tier label
+    truePotential = truePotential >= 93 ? 'Franchise'
+      : truePotential >= 87 ? 'Elite'
+      : truePotential >= 83 ? 'Top 6'
+      : truePotential >= 79 ? 'Top 9'
+      : truePotential >= 74 ? 'Bottom 6' : 'AHL';
+  }
+  const visibility = SCOUTING_CONFIG.potentialVisibility[scoutLevel] || 'hidden';
+
+  if (visibility === 'hidden') {
+    return { display: '???', confidence: 'none', isExact: false };
+  }
+  if (visibility === 'range') {
+    const trueIdx = TIERS.indexOf(truePotential);
+    const seed = hashString(`${player.id}_pot_range`);
+    const dir = seededRandom(seed) > 0.5 ? 1 : -1;
+    const otherIdx = Math.max(0, Math.min(TIERS.length - 1, trueIdx + dir));
+    const lo = TIERS[Math.max(trueIdx, otherIdx)];
+    const hi = TIERS[Math.min(trueIdx, otherIdx)];
+    return { display: lo === hi ? lo : `${hi} — ${lo}`, confidence: 'low', isExact: false };
+  }
+  if (visibility === 'approximate') {
+    const seed = hashString(`${player.id}_pot_approx`);
+    if (seededRandom(seed) < 0.80) {
+      return { display: truePotential || '???', confidence: 'medium', isExact: false };
+    }
+    const trueIdx = TIERS.indexOf(truePotential);
+    const off = seededRandom(seed + 1) > 0.5 ? 1 : -1;
+    const wrongIdx = Math.max(0, Math.min(TIERS.length - 1, trueIdx + off));
+    return { display: TIERS[wrongIdx], confidence: 'medium', isExact: false };
+  }
+  // exact
+  return { display: truePotential || '???', confidence: 'exact', isExact: true };
+}
+
+// ---- Visible role ----
+function getVisibleRole(player, scoutLevel) {
+  const trueRole = player.role;
+  if (scoutLevel === 0) return { display: '???', isExact: false };
+  if (scoutLevel === 1) {
+    const seed = hashString(`${player.id}_role_1`);
+    if (seededRandom(seed) < 0.60) return { display: trueRole, isExact: false, confidence: 'low' };
+    return { display: getSimilarRole(trueRole), isExact: false, confidence: 'low' };
+  }
+  if (scoutLevel === 2) {
+    const seed = hashString(`${player.id}_role_2`);
+    if (seededRandom(seed) < 0.90) return { display: trueRole, isExact: false, confidence: 'medium' };
+    return { display: getSimilarRole(trueRole), isExact: false, confidence: 'medium' };
+  }
+  return { display: trueRole, isExact: true, confidence: 'exact' };
+}
+
+function getSimilarRole(role) {
+  const similar = {
+    'Sniper': ['Playmaker','Power Forward'],
+    'Playmaker': ['Sniper','Two-Way Forward'],
+    'Power Forward': ['Sniper','Grinder'],
+    'Two-Way Forward': ['Playmaker','Grinder'],
+    'Grinder': ['Two-Way Forward','Enforcer'],
+    'Enforcer': ['Grinder','Power Forward'],
+    'Offensive Defenseman': ['Two-Way Defenseman'],
+    'Defensive Defenseman': ['Two-Way Defenseman','Enforcer Defenseman'],
+    'Two-Way Defenseman': ['Offensive Defenseman','Defensive Defenseman'],
+    'Enforcer Defenseman': ['Defensive Defenseman'],
+    'Butterfly': ['Hybrid'],
+    'Hybrid': ['Butterfly','Stand Up'],
+    'Stand Up': ['Hybrid'],
+  };
+  const opts = similar[role];
+  if (!opts || !opts.length) return role;
+  return opts[Math.floor(Math.random() * opts.length)];
+}
+
+// ---- Master visibility function ----
+function getPlayerView(viewingTeamId, player, teamScouting) {
+  // Own player or no team context — full visibility
+  if (!viewingTeamId || player.teamId === viewingTeamId) {
+    return {
+      attributes: player.attributes || {},
+      overall: player.overall,
+      ovrRange: null,
+      potential: { display: playerPotentialLabel(player), confidence: 'exact', isExact: true },
+      role: { display: player.role, isExact: true, confidence: 'exact' },
+      confidence: 'exact',
+      scoutLevel: 'own',
+      attributeCount: Object.keys(player.attributes || {}).length,
+    };
+  }
+
+  const scoutData = teamScouting?.scoutedPlayers?.[player.id];
+  const scoutLevel = scoutData?.level ?? 0;
+
+  const visibleAttrs = getVisibleAttributes(player, scoutLevel);
+  const visibleOVR   = getVisibleOVR(player, scoutLevel);
+  const visiblePot   = getVisiblePotential(player, scoutLevel);
+  const visibleRole  = getVisibleRole(player, scoutLevel);
+
+  return {
+    attributes: visibleAttrs,
+    overall: visibleOVR.estimate,
+    ovrRange: visibleOVR.range,
+    potential: visiblePot,
+    role: visibleRole,
+    confidence: ['none','low','medium','high','exact'][scoutLevel] || 'none',
+    scoutLevel,
+    attributeCount: Object.keys(visibleAttrs).length,
+    totalAttributes: Object.keys(player.attributes || {}).length,
+  };
+}
+
+function playerPotentialLabel(player) {
+  if (typeof player.truePotential === 'string') return player.truePotential;
+  const p = player.potential || player.scoutedPotential;
+  if (!p) return '???';
+  return p >= 93 ? 'Franchise' : p >= 87 ? 'Elite' : p >= 83 ? 'Top 6'
+    : p >= 79 ? 'Top 9' : p >= 74 ? 'Bottom 6' : 'AHL';
+}
+
+// ---- Token economy ----
+function initTeamScouting(aiTier = null) {
+  return {
+    tokens: { total: SCOUTING_CONFIG.tokensPerSeason, spent: 0, remaining: SCOUTING_CONFIG.tokensPerSeason },
+    scoutedPlayers: {},
+    aiTier: aiTier || assignAIScoutingTier(),
+  };
+}
+
+function assignAIScoutingTier() {
+  const tiers = ['poor','average','average','good','good','elite'];
+  return tiers[Math.floor(Math.random() * tiers.length)];
+}
+
+function refreshScoutingTokens(team) {
+  return {
+    ...team,
+    scouting: {
+      ...(team.scouting || initTeamScouting()),
+      tokens: { total: SCOUTING_CONFIG.tokensPerSeason, spent: 0, remaining: SCOUTING_CONFIG.tokensPerSeason },
+    },
+  };
+}
+
+function getTokensRequired(currentLevel, targetLevel, isProspect = true) {
+  const tbl = isProspect ? SCOUTING_CONFIG.cumulativeCost : SCOUTING_CONFIG.freeAgentCumulativeCost;
+  return (tbl[targetLevel] || 0) - (tbl[currentLevel] || 0);
+}
+
+// ---- Scout report text generation ----
+const SCOUT_VERBS_GOOD = ['elite','excellent','outstanding','high-end','strong'];
+const SCOUT_VERBS_MED  = ['solid','reliable','capable','respectable','decent'];
+const SCOUT_VERBS_LOW  = ['below-average','limited','underwhelming','pedestrian','unproven'];
+
+function attrGrade(val) {
+  return val >= 85 ? SCOUT_VERBS_GOOD[val % SCOUT_VERBS_GOOD.length]
+    : val >= 72 ? SCOUT_VERBS_MED[val % SCOUT_VERBS_MED.length]
+    : SCOUT_VERBS_LOW[val % SCOUT_VERBS_LOW.length];
+}
+
+function formatAttrName(key) {
+  return key.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase()).trim();
+}
+
+function generateScoutReportText(player, scoutLevel) {
+  const name = `${player.firstName} ${player.lastName}`;
+  const pos = player.position;
+  const age = player.age || 18;
+  const attrs = player.attributes || {};
+
+  // Sort attrs by value
+  const sorted = Object.entries(attrs).sort((a, b) => b[1] - a[1]);
+  const top2 = sorted.slice(0, 2).map(([k, v]) => `${formatAttrName(k)} (${attrGrade(v)})`);
+  const weak = sorted.slice(-1).map(([k, v]) => formatAttrName(k));
+
+  if (scoutLevel === 1) {
+    const impressions = [
+      `${name} is a ${age}-year-old ${pos} who shows flashes of potential. Needs more evaluation.`,
+      `Initial look at ${name} reveals a player with some upside. Role unclear — further scouting needed.`,
+      `${name} has the physical profile worth monitoring. Limited data available — recommend deeper look.`,
+    ];
+    return impressions[hashString(player.id) % impressions.length];
+  }
+  if (scoutLevel === 2) {
+    return top2.length >= 2
+      ? `${name} projects as a ${player.role || pos} with ${top2[0]} and ${top2[1]}. ${weak.length ? `Concern: ${weak[0]}.` : ''} Ceiling looks promising.`
+      : `${name} shows solid attributes for a ${pos}. Detailed evaluation suggests a reliable player at this level.`;
+  }
+  if (scoutLevel === 3) {
+    const top3 = sorted.slice(0, 3).map(([k, v]) => `${formatAttrName(k)} (${v})`).join(', ');
+    return `Comprehensive evaluation of ${name}: ${pos}, age ${age}, role ${player.role || 'unknown'}. Top tools: ${top3}. Potential ceiling: ${playerPotentialLabel(player)}. True OVR: ${player.overall || '?'}.`;
+  }
+  return 'No scouting data available.';
+}
+
+function generateScoutReport(player, scoutLevel) {
+  const attrs = player.attributes || {};
+  const sorted = Object.entries(attrs).sort((a, b) => b[1] - a[1]);
+  const strengthCount = scoutLevel >= 2 ? 4 : 2;
+  const strengths = sorted.slice(0, strengthCount).map(([k, v]) => ({
+    attribute: formatAttrName(k), value: v, isExact: scoutLevel >= 3,
+  }));
+  const weaknesses = sorted.slice(-Math.min(scoutLevel >= 2 ? 3 : 1, sorted.length)).map(([k, v]) => ({
+    attribute: formatAttrName(k), value: v, isExact: scoutLevel >= 3,
+  }));
+  const ovr = player.overall || 70;
+  const archetypes = {
+    'Sniper':              ovr >= 85 ? 'Elite goal scorer'   : ovr >= 75 ? 'Second-line sniper'     : 'Bottom-six shooter',
+    'Playmaker':           ovr >= 85 ? 'Franchise center'    : ovr >= 75 ? 'Skilled setup man'       : 'Depth passer',
+    'Power Forward':       ovr >= 85 ? 'Dominant power game' : ovr >= 75 ? 'Physical scorer'         : 'Energy forward',
+    'Two-Way Forward':     ovr >= 85 ? 'Selke-caliber'       : ovr >= 75 ? 'Reliable both ways'      : 'Checking center',
+    'Grinder':             ovr >= 85 ? 'Top shutdown forward': ovr >= 75 ? 'Reliable grinder'        : 'Depth role player',
+    'Enforcer':            ovr >= 85 ? 'Feared enforcer'     : ovr >= 75 ? 'Physical presence'       : 'Roster insurance',
+    'Offensive Defenseman':ovr >= 85 ? 'Norris candidate'    : ovr >= 75 ? 'PP quarterback'          : 'Sheltered offensive D',
+    'Defensive Defenseman':ovr >= 85 ? 'Shutdown #1 D'       : ovr >= 75 ? 'Steady defensive pair'   : 'Third-pair D',
+    'Two-Way Defenseman':  ovr >= 85 ? 'Complete two-way D'  : ovr >= 75 ? 'Versatile top-four'      : 'Solid depth D',
+    'Enforcer Defenseman': ovr >= 85 ? 'Physical anchor'     : ovr >= 75 ? 'Hard-hitting pair D'     : 'Depth enforcer D',
+    'Butterfly':           ovr >= 85 ? 'Franchise netminder' : ovr >= 75 ? 'Solid starter'           : 'Backup depth',
+    'Hybrid':              ovr >= 85 ? 'Elite goalie'        : ovr >= 75 ? 'Competent starter'       : 'Depth goalie',
+    'Stand Up':            ovr >= 85 ? 'Veteran starter'     : ovr >= 75 ? 'Serviceable starter'     : 'AHL callup',
+  };
+  return {
+    level: scoutLevel,
+    levelLabel: SCOUTING_CONFIG.confidenceLabels[scoutLevel],
+    text: generateScoutReportText(player, scoutLevel),
+    strengths,
+    weaknesses,
+    comparable: scoutLevel >= 2 ? (archetypes[player.role] || null) : null,
+    projectedPotential: getVisiblePotential(player, scoutLevel),
+  };
+}
+
+// ---- Scout a prospect (user team) ----
+function scoutPlayerFull(teamScouting, player, targetLevel, isProspect = true) {
+  const existing = teamScouting.scoutedPlayers?.[player.id] || { level: 0, tokensCost: 0, type: isProspect ? 'prospect' : 'free_agent', reports: [] };
+  const currentLevel = existing.level || 0;
+  if (targetLevel <= currentLevel) return { success: false, reason: 'Already scouted to this level or higher.' };
+  if (targetLevel > 3) return { success: false, reason: 'Maximum scouting level is 3.' };
+
+  const cost = getTokensRequired(currentLevel, targetLevel, isProspect);
+  if ((teamScouting.tokens?.remaining ?? 0) < cost) {
+    return { success: false, reason: `Not enough tokens. Need ${cost}, have ${teamScouting.tokens?.remaining ?? 0}.` };
+  }
+
+  const report = generateScoutReport(player, targetLevel);
+  const newTokens = {
+    ...teamScouting.tokens,
+    spent: (teamScouting.tokens?.spent || 0) + cost,
+    remaining: (teamScouting.tokens?.remaining || 0) - cost,
+  };
+  const newScoutedPlayers = {
+    ...teamScouting.scoutedPlayers,
+    [player.id]: {
+      level: targetLevel,
+      tokensCost: (existing.tokensCost || 0) + cost,
+      type: isProspect ? 'prospect' : 'free_agent',
+      reports: [...(existing.reports || []), report],
+      lastScouted: Date.now(),
+    },
+  };
+
+  return {
+    success: true,
+    level: targetLevel,
+    tokensSpent: cost,
+    report,
+    newScouting: { ...teamScouting, tokens: newTokens, scoutedPlayers: newScoutedPlayers },
+  };
+}
+
+// ---- AI scouting ----
+function getAIPlayerView(aiTier, player) {
+  const config = SCOUTING_CONFIG.aiScoutingTiers[aiTier] || SCOUTING_CONFIG.aiScoutingTiers.average;
+  const visibleAttrs = {};
+  for (const [key, val] of Object.entries(player.attributes || {})) {
+    const noise = (Math.random() * 2 - 1) * config.noiseLevel * 60;
+    visibleAttrs[key] = Math.max(1, Math.min(99, Math.round(val + noise)));
+  }
+  const ovrNoise = (Math.random() * 2 - 1) * config.noiseLevel * 30;
+  const visibleOVR = Math.max(40, Math.min(99, Math.round((player.overall || 70) + ovrNoise)));
+  const TIERS = ['Franchise','Elite','Top 6','Top 9','Bottom 6','AHL'];
+  let visiblePotential = playerPotentialLabel(player);
+  if (Math.random() > config.potentialAccuracy) {
+    const trueIdx = TIERS.indexOf(visiblePotential);
+    const off = Math.random() > 0.5 ? 1 : -1;
+    const wrongIdx = Math.max(0, Math.min(TIERS.length - 1, trueIdx + off));
+    visiblePotential = TIERS[wrongIdx];
+  }
+  return { attributes: visibleAttrs, overall: visibleOVR, potential: visiblePotential };
+}
+
+function aiDraftDecisionEnhanced(aiTeam, availableProspects) {
+  const aiTier = aiTeam.scouting?.aiTier || 'average';
+  const POTENTIAL_BONUS = { 'Franchise': 30, 'Elite': 22, 'Top 6': 14, 'Top 9': 8, 'Bottom 6': 3, 'AHL': 0 };
+  const POSITION_NEEDS = assessTeamNeeds(aiTeam);
+
+  const evaluated = availableProspects.map(p => {
+    const view = getAIPlayerView(aiTier, p);
+    let score = view.overall * 2;
+    score += POTENTIAL_BONUS[view.potential] || 0;
+    if (POSITION_NEEDS.includes(p.position)) score += 12;
+    if ((p.age || 18) <= 18) score += 5;
+    return { prospect: p, score };
+  });
+  evaluated.sort((a, b) => b.score - a.score);
+  return evaluated[0]?.prospect || availableProspects[0];
+}
+
+function assessTeamNeeds(team) {
+  const players = team.players.filter(p => !p.isExtra && !p.injury);
+  const counts = {};
+  players.forEach(p => { counts[p.position] = (counts[p.position] || 0) + 1; });
+  // Find weakest positions (below average overall for that position)
+  const avgByPos = {};
+  players.forEach(p => {
+    if (!avgByPos[p.position]) avgByPos[p.position] = [];
+    avgByPos[p.position].push(p.overall || 70);
+  });
+  const needs = [];
+  for (const [pos, ovrs] of Object.entries(avgByPos)) {
+    const avg = ovrs.reduce((a, b) => a + b, 0) / ovrs.length;
+    if (avg < 74) needs.push(pos);
+  }
+  return needs.length ? needs : ['C', 'LD']; // Fallback
+}
+
+// ---- Scouting degradation (call at season start) ----
+function degradeOldScoutingData(team, currentSeasonNum) {
+  if (!team.scouting?.scoutedPlayers) return team;
+  const newScoutedPlayers = {};
+  for (const [pid, data] of Object.entries(team.scouting.scoutedPlayers)) {
+    // lastScouted stored as season number via Date.now() — skip degradation for now
+    // We degrade based on type: only prospects degrade (FAs cycle out naturally)
+    if (data.type === 'prospect') {
+      // Keep level but mark as potentially stale after 2 seasons
+      newScoutedPlayers[pid] = data;
+    } else {
+      newScoutedPlayers[pid] = data;
+    }
+  }
+  return { ...team, scouting: { ...team.scouting, scoutedPlayers: newScoutedPlayers } };
+}
+
+
 // Spending a scouting token on a prospect reveals their potential more accurately
 function scoutProspect(prospect) {
   const newAccuracy = prospect.potentialAccuracy === 'Unknown' ? 'Projected' :
@@ -5600,6 +6135,7 @@ function OffseasonWorkflowView({
   step, seasonNum, summary, developmentResults, retiredPlayers, draftState,
   teams, freeAgents, awards, champion,
   onAdvanceStep, onScoutProspect, onDraftPick, onSign, onRelease, onStartNewSeason,
+  userTeamScouting,
 }) {
   const stepIndex = OFFSEASON_STEPS.findIndex(s => s.key === step);
 
@@ -5636,7 +6172,7 @@ function OffseasonWorkflowView({
         <RetirementsPanel retired={retiredPlayers} onNext={onAdvanceStep} />
       )}
       {step === 'draft' && (
-        <DraftDayPanel draftState={draftState} teams={teams} onScout={onScoutProspect} onPick={onDraftPick} />
+        <DraftDayPanel draftState={draftState} teams={teams} onScout={onScoutProspect} onPick={onDraftPick} userTeamScouting={userTeamScouting} />
       )}
       {step === 'freeAgency' && (
         <OffseasonFAPanel teams={teams} freeAgents={freeAgents} onSign={onSign} onRelease={onRelease} onNext={onAdvanceStep} />
@@ -5830,7 +6366,7 @@ function RetirementsPanel({ retired, onNext }) {
 // DRAFT DAY PANEL
 // ============================================================
 
-function DraftDayPanel({ draftState, teams, onScout, onPick }) {
+function DraftDayPanel({ draftState, teams, onScout, onPick, userTeamScouting }) {
   const [selectedProspect, setSelectedProspect] = useState(null);
   if (!draftState) return null;
 
@@ -5838,6 +6374,9 @@ function DraftDayPanel({ draftState, teams, onScout, onPick }) {
   const availableProspects = prospects.filter(p => !draftHistory.some(d => d.prospectId === p.id));
   const currentPick = picks[currentPickIndex];
   const isUserPick = currentPick?.isUserPick && !isComplete;
+  // Phase 3: use full scouting state
+  const scouting = userTeamScouting || { tokens: { total: 30, spent: 0, remaining: scoutingTokens || 3 }, scoutedPlayers: {} };
+  const tokens = scouting.tokens;
 
   const potentialColor = (acc) => acc === 'Exact' ? 'text-green-400' : acc === 'Accurate' ? 'text-blue-400' : acc === 'Projected' ? 'text-yellow-400' : 'text-gray-400';
 
@@ -5880,7 +6419,7 @@ function DraftDayPanel({ draftState, teams, onScout, onPick }) {
           Entry Draft — Round {currentPick?.round}, Pick {currentPick?.pick}
         </h2>
         <div className="flex items-center gap-2">
-          <span className="text-yellow-400 text-sm">🔬 Scouting Tokens: {scoutingTokens}</span>
+          <ScoutingTokenBar tokens={tokens} className="w-48" />
         </div>
       </div>
 
@@ -5904,61 +6443,59 @@ function DraftDayPanel({ draftState, teams, onScout, onPick }) {
             <span className="text-gray-300 text-sm font-semibold">Available Prospects ({availableProspects.length})</span>
           </div>
           <div className="overflow-y-auto max-h-80">
-            {availableProspects.map((p, i) => (
-              <div key={p.id}
-                onClick={() => setSelectedProspect(p.id === selectedProspect ? null : p.id)}
-                className={`px-3 py-2 border-b border-gray-700 cursor-pointer hover:bg-gray-700 transition
-                  ${selectedProspect === p.id ? 'bg-gray-700 border-l-2 border-l-blue-500' : ''}`}>
-                <div className="flex justify-between items-center">
-                  <div>
-                    <span className="text-white text-sm font-bold">{p.firstName} {p.lastName}</span>
-                    <span className="text-gray-400 text-xs ml-2">{p.position} — {p.role.split(' ')[0]}</span>
+            {availableProspects.map((p, i) => {
+              const sd = scouting.scoutedPlayers?.[p.id];
+              const sl = sd?.level ?? 0;
+              const vOVR = getVisibleOVR(p, sl);
+              const vPot = getVisiblePotential(p, sl);
+              return (
+                <div key={p.id}
+                  onClick={() => setSelectedProspect(p.id === selectedProspect ? null : p.id)}
+                  className={`px-3 py-2 border-b border-gray-700 cursor-pointer hover:bg-gray-700 transition
+                    ${selectedProspect === p.id ? 'bg-gray-700 border-l-2 border-l-blue-500' : ''}`}>
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <span className="text-white text-sm font-bold">{p.firstName} {p.lastName}</span>
+                      <span className="text-gray-400 text-xs ml-2">{p.position}</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-gray-300">
+                        {sl >= 3 ? `${p.overall}✓` : sl >= 1 ? `~${vOVR.estimate}` : `${vOVR.range.min}–${vOVR.range.max}`}
+                      </span>
+                      <ScoutBadge scoutLevel={sl} />
+                    </div>
                   </div>
-                  <div className="text-right text-xs">
-                    <div className="text-gray-300">OVR {p.overall}</div>
-                    <div className={potentialColor(p.potentialAccuracy)}>Pot ~{p.scoutedPotential}</div>
-                  </div>
+                  {sl >= 1 && <div className="text-xs text-gray-500 mt-0.5">Potential: {vPot.display}</div>}
                 </div>
-                {p.scouted && <div className="text-blue-400 text-xs mt-0.5 italic">"{p.scoutReport?.slice(0,50)}..."</div>}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
         {/* Selected prospect detail / action panel */}
-        <div className="bg-gray-800 rounded-xl border border-gray-700 p-4 min-h-40">
+        <div className="min-h-40">
           {selectedProspect ? (() => {
             const p = availableProspects.find(pr => pr.id === selectedProspect);
             if (!p) return null;
             return (
               <div className="space-y-3">
-                <div>
-                  <div className="text-white font-bold text-lg">{p.firstName} {p.lastName}</div>
-                  <div className="text-gray-400 text-sm">{p.position} — {p.role} — Age {p.age}</div>
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div><span className="text-gray-400">Overall: </span><span className="text-white font-bold">{p.overall}</span></div>
-                  <div><span className="text-gray-400">Potential: </span><span className={`font-bold ${potentialColor(p.potentialAccuracy)}`}>~{p.scoutedPotential} ({p.potentialAccuracy})</span></div>
-                  <div><span className="text-gray-400">Scouts rank: </span><span className="text-gray-300">#{p.centralRank}</span></div>
-                  <div><span className="text-gray-400">Dev rate: </span><span className="text-gray-300">{p.developmentRate >= 1.2 ? '⚡ Fast' : p.developmentRate >= 0.9 ? '→ Normal' : '🐢 Slow'}</span></div>
-                </div>
-                {p.scouted && <div className="text-blue-300 text-xs italic bg-gray-700 rounded-lg p-2">"{p.scoutReport}"</div>}
+                <ProspectDetailCard
+                  prospect={p}
+                  scoutData={scouting.scoutedPlayers?.[p.id]}
+                  tokens={tokens}
+                  onScout={isUserPick ? onScout : null}
+                  isUserTurn={isUserPick}
+                />
                 <div className="flex gap-2 flex-wrap">
-                  {isUserPick && scoutingTokens > 0 && p.potentialAccuracy !== 'Exact' && (
-                    <button onClick={() => onScout(p.id)}
-                      className="bg-yellow-700 hover:bg-yellow-600 text-white text-sm px-3 py-1.5 rounded-lg transition">
-                      🔬 Scout (1 token)
-                    </button>
-                  )}
                   {isUserPick && (
                     <button onClick={() => onPick(p.id)}
-                      className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm px-4 py-1.5 rounded-lg transition">
+                      className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm px-4 py-2 rounded-lg transition w-full">
                       Draft {p.firstName} {p.lastName}
                     </button>
                   )}
                   {!isUserPick && (
                     <button onClick={() => onPick(null)}
-                      className="bg-gray-600 hover:bg-gray-500 text-white text-sm px-4 py-1.5 rounded-lg transition">
+                      className="bg-gray-600 hover:bg-gray-500 text-white text-sm px-4 py-2 rounded-lg transition w-full">
                       AI Pick →
                     </button>
                   )}
@@ -5966,7 +6503,7 @@ function DraftDayPanel({ draftState, teams, onScout, onPick }) {
               </div>
             );
           })() : (
-            <div className="text-center text-gray-500 mt-8">
+            <div className="bg-gray-800 rounded-xl border border-gray-700 text-center text-gray-500 mt-2 p-8">
               <div className="text-2xl mb-2">👆</div>
               <p className="text-sm">Select a prospect to view details</p>
               {!isUserPick && (
@@ -6867,6 +7404,485 @@ function LeagueStrategyView({ teams }) {
     </div>
   );
 }
+
+// ============================================================
+// PHASE 3 — SCOUTING UI COMPONENTS
+// ============================================================
+
+function ScoutingTokenBar({ tokens, className = '' }) {
+  if (!tokens) return null;
+  const pct = Math.round((tokens.remaining / tokens.total) * 100);
+  const color = pct > 60 ? '#2ed573' : pct > 30 ? '#ed8936' : '#ef4444';
+  return (
+    <div className={`${className}`}>
+      <div className="flex items-center justify-between mb-1 text-xs">
+        <span className="text-gray-400">Scouting Tokens</span>
+        <span style={{ color }} className="font-bold">{tokens.remaining} / {tokens.total} remaining</span>
+      </div>
+      <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+        <div className="h-2 rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: color }} />
+      </div>
+      <div className="flex justify-between text-xs text-gray-500 mt-0.5">
+        <span>Spent: {tokens.spent}</span>
+        <span>Can basic-scout: {tokens.remaining}</span>
+      </div>
+    </div>
+  );
+}
+
+function ScoutBadge({ scoutLevel }) {
+  const icons  = ['❓','🔍','📋','🎯'];
+  const labels = ['Unscouted','Basic','Detailed','Elite'];
+  const colors = ['text-gray-500','text-orange-400','text-blue-400','text-green-400'];
+  return (
+    <span className={`text-xs font-medium ${colors[scoutLevel] || colors[0]}`}>
+      {icons[scoutLevel] || icons[0]} {labels[scoutLevel] || 'Unscouted'}
+    </span>
+  );
+}
+
+function AttributeBar({ label, value, isEstimate = false, isHidden = false }) {
+  if (isHidden) return (
+    <div className="flex items-center gap-2 text-sm">
+      <span className="text-gray-500 w-40 truncate text-xs">{label}</span>
+      <div className="flex-1 h-2 bg-gray-800 rounded-full" />
+      <span className="text-gray-600 text-xs w-8 text-right">???</span>
+    </div>
+  );
+  const pct = Math.round((value / 99) * 100);
+  const barColor = value >= 85 ? '#2ed573' : value >= 75 ? '#5b9bd5' : value >= 65 ? '#ed8936' : '#ef4444';
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <span className={`w-40 truncate text-xs ${isEstimate ? 'text-gray-400' : 'text-gray-300'}`}>
+        {label}{isEstimate ? ' ~' : ''}
+      </span>
+      <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+        <div className="h-2 rounded-full" style={{ width: `${pct}%`, backgroundColor: barColor }} />
+      </div>
+      <span className={`text-xs w-8 text-right font-mono ${isEstimate ? 'text-gray-400' : 'text-white'}`}>{value}</span>
+    </div>
+  );
+}
+
+function ProspectDetailCard({ prospect, scoutData, tokens, onScout, isUserTurn = true }) {
+  const scoutLevel = scoutData?.level ?? 0;
+  const icon  = SCOUTING_CONFIG.confidenceIcons[scoutLevel];
+  const label = SCOUTING_CONFIG.confidenceLabels[scoutLevel];
+  const confidenceColor = ['text-gray-500','text-orange-400','text-blue-400','text-green-400'][scoutLevel];
+  const pct = [0, 33, 66, 100][scoutLevel];
+
+  const visibleAttrs = getVisibleAttributes(prospect, scoutLevel);
+  const visibleOVR   = getVisibleOVR(prospect, scoutLevel);
+  const visiblePot   = getVisiblePotential(prospect, scoutLevel);
+  const visibleRole  = getVisibleRole(prospect, scoutLevel);
+
+  const allAttrKeys  = Object.keys(prospect.attributes || {});
+  const visibleKeys  = Object.keys(visibleAttrs);
+  const hiddenCount  = allAttrKeys.length - visibleKeys.length;
+
+  const latestReport = scoutData?.reports?.[scoutData.reports.length - 1];
+
+  const tokensLeft = tokens?.remaining ?? 0;
+
+  function canScout(targetLevel) {
+    if (targetLevel <= scoutLevel) return false;
+    const cost = getTokensRequired(scoutLevel, targetLevel, true);
+    return tokensLeft >= cost;
+  }
+  function scoutCost(targetLevel) {
+    return getTokensRequired(scoutLevel, targetLevel, true);
+  }
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      {/* Header */}
+      <div className="px-4 py-3 border-b border-gray-700 bg-gray-750">
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-white font-bold text-lg">{prospect.firstName} {prospect.lastName}</div>
+            <div className="text-gray-400 text-sm">{prospect.position} · Age {prospect.age} · Round {prospect.draftRound}, Pick {prospect.draftPick}</div>
+          </div>
+          <ScoutBadge scoutLevel={scoutLevel} />
+        </div>
+      </div>
+
+      {/* Confidence bar */}
+      <div className="px-4 py-2 border-b border-gray-700 bg-gray-800">
+        <div className="flex items-center gap-2 mb-1">
+          <span className={`text-xs font-semibold ${confidenceColor}`}>{icon} {label}</span>
+        </div>
+        <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+          <div className={`h-1.5 rounded-full transition-all`}
+            style={{ width: `${pct}%`, backgroundColor: SCOUTING_CONFIG.confidenceColors[scoutLevel] }} />
+        </div>
+      </div>
+
+      {/* Core stats */}
+      <div className="px-4 py-3 border-b border-gray-700 grid grid-cols-3 gap-3 text-sm">
+        <div>
+          <div className="text-gray-400 text-xs mb-0.5">Overall</div>
+          {scoutLevel === 0 ? (
+            <div className="text-gray-300 font-bold">
+              {visibleOVR.range.min}–{visibleOVR.range.max}
+            </div>
+          ) : scoutLevel >= 3 ? (
+            <div className="text-green-400 font-bold">{prospect.overall} <span className="text-xs">✓</span></div>
+          ) : (
+            <div className="text-white font-bold">
+              ~{visibleOVR.estimate} <span className="text-gray-500 text-xs">({visibleOVR.range.min}–{visibleOVR.range.max})</span>
+            </div>
+          )}
+        </div>
+        <div>
+          <div className="text-gray-400 text-xs mb-0.5">Potential</div>
+          <div className={`font-bold text-sm ${visiblePot.confidence === 'exact' ? 'text-green-400' : visiblePot.confidence === 'medium' ? 'text-blue-300' : visiblePot.confidence === 'low' ? 'text-yellow-300' : 'text-gray-500'}`}>
+            {visiblePot.display}
+            {visiblePot.isExact && <span className="text-xs ml-1">✓</span>}
+          </div>
+        </div>
+        <div>
+          <div className="text-gray-400 text-xs mb-0.5">Role</div>
+          <div className={`font-medium text-sm ${visibleRole.isExact ? 'text-green-400' : visibleRole.confidence === 'medium' ? 'text-blue-300' : scoutLevel > 0 ? 'text-yellow-300' : 'text-gray-500'}`}>
+            {visibleRole.display}
+          </div>
+        </div>
+      </div>
+
+      {/* Attributes */}
+      <div className="px-4 py-3 border-b border-gray-700">
+        <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+          Attributes ({visibleKeys.length}/{allAttrKeys.length})
+        </div>
+        {scoutLevel === 0 ? (
+          <div className="text-gray-500 text-sm italic py-2">No attribute data — invest scouting tokens to reveal.</div>
+        ) : (
+          <div className="space-y-1.5">
+            {visibleKeys.map(key => (
+              <AttributeBar key={key} label={formatAttrName(key)} value={visibleAttrs[key]} isEstimate={scoutLevel < 3} />
+            ))}
+            {hiddenCount > 0 && (
+              <div className="text-gray-600 text-xs italic mt-1">⚠️ {hiddenCount} more attribute{hiddenCount !== 1 ? 's' : ''} hidden — upgrade scout to reveal.</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Scout report */}
+      {latestReport && (
+        <div className="px-4 py-3 border-b border-gray-700">
+          <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">Scout Report</div>
+          <div className="text-gray-300 text-sm italic bg-gray-750 rounded-lg p-2 mb-2">
+            "{latestReport.text}"
+          </div>
+          {latestReport.comparable && (
+            <div className="text-xs text-blue-300">Comparable: {latestReport.comparable}</div>
+          )}
+          {latestReport.strengths?.length > 0 && (
+            <div className="mt-1 text-xs">
+              <span className="text-green-400">✓ Strengths: </span>
+              <span className="text-gray-300">{latestReport.strengths.map(s => s.attribute).join(', ')}</span>
+            </div>
+          )}
+          {latestReport.weaknesses?.length > 0 && (
+            <div className="mt-0.5 text-xs">
+              <span className="text-red-400">✗ Concerns: </span>
+              <span className="text-gray-300">{latestReport.weaknesses.map(w => w.attribute).join(', ')}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Scout action buttons */}
+      {isUserTurn && (
+        <div className="px-4 py-3">
+          <div className="text-xs text-gray-400 mb-2">Invest tokens ({tokensLeft} remaining):</div>
+          <div className="flex flex-wrap gap-2">
+            {scoutLevel < 1 && (
+              <button
+                disabled={!canScout(1)}
+                onClick={() => onScout && onScout(prospect.id, 1)}
+                className="bg-orange-700 hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-3 py-1.5 rounded-lg transition">
+                🔍 Basic Scout — {scoutCost(1)}🪙
+              </button>
+            )}
+            {scoutLevel < 2 && (
+              <button
+                disabled={!canScout(2)}
+                onClick={() => onScout && onScout(prospect.id, 2)}
+                className="bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-3 py-1.5 rounded-lg transition">
+                📋 Detailed Scout — {scoutCost(2)}🪙
+              </button>
+            )}
+            {scoutLevel < 3 && (
+              <button
+                disabled={!canScout(3)}
+                onClick={() => onScout && onScout(prospect.id, 3)}
+                className="bg-green-700 hover:bg-green-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-3 py-1.5 rounded-lg transition">
+                🎯 Elite Scout — {scoutCost(3)}🪙
+              </button>
+            )}
+            {scoutLevel >= 3 && (
+              <div className="text-green-400 text-xs font-semibold">✅ Fully Scouted — Maximum confidence</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FreeAgentScoutCard({ player, scoutData, tokens, onScout }) {
+  const scoutLevel = scoutData?.level ?? 0;
+  const icon  = SCOUTING_CONFIG.confidenceIcons[scoutLevel];
+  const visibleOVR = getVisibleOVR(player, scoutLevel);
+  const visiblePot = getVisiblePotential(player, scoutLevel);
+  const visibleAttrs = getVisibleAttributes(player, scoutLevel);
+  const latestReport = scoutData?.reports?.[scoutData.reports.length - 1];
+  const tokensLeft = tokens?.remaining ?? 0;
+  const FA_COSTS = SCOUTING_CONFIG.freeAgentCumulativeCost;
+
+  function faCost(targetLevel) {
+    return (FA_COSTS[targetLevel] || 0) - (FA_COSTS[scoutLevel] || 0);
+  }
+
+  const ss = player.seasonStats || {};
+  const isGoalie = player.position === 'G';
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 p-4 space-y-3">
+      {/* Header */}
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="text-white font-semibold">{player.firstName} {player.lastName}</div>
+          <div className="text-gray-400 text-xs">{player.position} · Age {player.age} · OVR: {
+            scoutLevel >= 3 ? `${player.overall} ✓` :
+            scoutLevel >= 1 ? `~${visibleOVR.estimate} (${visibleOVR.range.min}–${visibleOVR.range.max})` :
+            `${visibleOVR.range.min}–${visibleOVR.range.max}`
+          }</div>
+        </div>
+        <ScoutBadge scoutLevel={scoutLevel} />
+      </div>
+
+      {/* Season stats always visible */}
+      <div className="flex gap-4 text-xs text-gray-300">
+        {isGoalie ? (
+          <>
+            <span>GP: {ss.GP || 0}</span>
+            <span>GAA: {ss.GP > 0 && ss.GA !== undefined ? ((ss.GA / ss.GP) * (60 / 60)).toFixed(2) : '—'}</span>
+            <span>SV%: {ss.SA > 0 ? (ss.SV / ss.SA).toFixed(3) : '—'}</span>
+            <span>SO: {ss.SO || 0}</span>
+          </>
+        ) : (
+          <>
+            <span>GP: {ss.GP || 0}</span>
+            <span>G: {ss.G || 0}</span>
+            <span>A: {ss.A || 0}</span>
+            <span>PTS: {(ss.G || 0) + (ss.A || 0)}</span>
+          </>
+        )}
+      </div>
+
+      {/* Potential (hidden until level 2) */}
+      {scoutLevel >= 1 && (
+        <div className="text-xs">
+          <span className="text-gray-400">Potential: </span>
+          <span className="text-blue-300">{visiblePot.display}</span>
+        </div>
+      )}
+
+      {/* Visible attributes */}
+      {scoutLevel >= 1 && Object.keys(visibleAttrs).length > 0 && (
+        <div className="space-y-1">
+          {Object.entries(visibleAttrs).slice(0, 6).map(([key, val]) => (
+            <AttributeBar key={key} label={formatAttrName(key)} value={val} isEstimate={scoutLevel < 3} />
+          ))}
+        </div>
+      )}
+
+      {latestReport && (
+        <div className="text-gray-400 text-xs italic">"{latestReport.text?.slice(0, 80)}..."</div>
+      )}
+
+      {/* Scout buttons */}
+      <div className="flex flex-wrap gap-2">
+        {scoutLevel < 1 && (
+          <button disabled={tokensLeft < 1} onClick={() => onScout && onScout(player.id, 1, false)}
+            className="bg-orange-700 hover:bg-orange-600 disabled:opacity-40 text-white text-xs px-3 py-1 rounded-lg transition">
+            🔍 Basic — 1🪙
+          </button>
+        )}
+        {scoutLevel < 2 && (
+          <button disabled={tokensLeft < faCost(2)} onClick={() => onScout && onScout(player.id, 2, false)}
+            className="bg-blue-700 hover:bg-blue-600 disabled:opacity-40 text-white text-xs px-3 py-1 rounded-lg transition">
+            📋 Detailed — {faCost(2)}🪙
+          </button>
+        )}
+        {scoutLevel < 3 && (
+          <button disabled={tokensLeft < faCost(3)} onClick={() => onScout && onScout(player.id, 3, false)}
+            className="bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs px-3 py-1 rounded-lg transition">
+            🎯 Elite — {faCost(3)}🪙
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ScoutingHubView({ userTeam, freeAgents, draftState, onScout, onScoutFA }) {
+  const [tab, setTab] = React.useState('prospects');
+  const [selectedId, setSelectedId] = React.useState(null);
+  const scouting = userTeam.scouting || { tokens: { total: 30, spent: 0, remaining: 30 }, scoutedPlayers: {} };
+  const tokens = scouting.tokens;
+
+  // Prospects from draft state
+  const prospects = draftState?.prospects || [];
+  const availableProspects = prospects.filter(p => !draftState?.draftHistory?.some(d => d.prospectId === p.id));
+
+  const tabs = [
+    { key: 'prospects', label: 'Draft Prospects', count: availableProspects.length },
+    { key: 'fa', label: 'Free Agents', count: freeAgents?.length || 0 },
+    { key: 'reports', label: 'My Reports' },
+  ];
+
+  const selectedProspect = availableProspects.find(p => p.id === selectedId);
+  const selectedFA = freeAgents?.find(p => p.id === selectedId);
+
+  // Collect all reports
+  const allReports = Object.entries(scouting.scoutedPlayers || {}).flatMap(([pid, data]) =>
+    (data.reports || []).map(r => ({ ...r, playerId: pid, playerType: data.type }))
+  );
+
+  return (
+    <div className="p-4 space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-white text-xl font-bold">🔍 Scouting Center</h2>
+        <div className="text-sm text-gray-400">
+          Season {scouting.tokens?.remaining}/{scouting.tokens?.total} tokens
+        </div>
+      </div>
+
+      <ScoutingTokenBar tokens={tokens} />
+
+      {/* Strategy hint */}
+      <div className="bg-gray-800 rounded-xl border border-gray-700 p-3 text-xs text-gray-400">
+        <span className="text-yellow-400 font-semibold">💡 Strategy: </span>
+        With {tokens.remaining} tokens you can{' '}
+        <span className="text-white">fully scout {Math.floor(tokens.remaining / 6)} prospect{Math.floor(tokens.remaining / 6) !== 1 ? 's' : ''}</span>,{' '}
+        <span className="text-white">detailed-scout {Math.floor(tokens.remaining / 3)}</span>, or{' '}
+        <span className="text-white">basic-scout {tokens.remaining}</span>.
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-2 border-b border-gray-700 pb-2">
+        {tabs.map(t => (
+          <button key={t.key} onClick={() => { setTab(t.key); setSelectedId(null); }}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${tab === t.key ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+            {t.label}{t.count !== undefined ? ` (${t.count})` : ''}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'prospects' && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {/* Prospect list */}
+          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+            <div className="px-3 py-2 border-b border-gray-700 text-xs font-semibold text-gray-400 uppercase tracking-wide">
+              Available Prospects
+            </div>
+            {availableProspects.length === 0 && (
+              <div className="p-4 text-gray-500 text-sm text-center">
+                {draftState ? 'All prospects have been drafted.' : 'Draft class not available yet. Start the draft to scout prospects.'}
+              </div>
+            )}
+            <div className="overflow-y-auto max-h-96">
+              {availableProspects.map(p => {
+                const sd = scouting.scoutedPlayers?.[p.id];
+                const sl = sd?.level ?? 0;
+                const vOVR = getVisibleOVR(p, sl);
+                return (
+                  <div key={p.id}
+                    onClick={() => setSelectedId(p.id === selectedId ? null : p.id)}
+                    className={`px-3 py-2 border-b border-gray-700 cursor-pointer hover:bg-gray-700 transition ${selectedId === p.id ? 'bg-gray-700 border-l-2 border-l-blue-500' : ''}`}>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="text-white text-sm font-medium">{p.firstName} {p.lastName}</span>
+                        <span className="text-gray-400 text-xs ml-2">{p.position}</span>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-gray-400">
+                          {sl >= 3 ? `${p.overall} ✓` : sl >= 1 ? `~${vOVR.estimate}` : `${vOVR.range.min}–${vOVR.range.max}`}
+                        </span>
+                        <ScoutBadge scoutLevel={sl} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Detail card */}
+          <div>
+            {selectedProspect ? (
+              <ProspectDetailCard
+                prospect={selectedProspect}
+                scoutData={scouting.scoutedPlayers?.[selectedProspect.id]}
+                tokens={tokens}
+                onScout={onScout}
+                isUserTurn={true}
+              />
+            ) : (
+              <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 text-center text-gray-500">
+                <div className="text-3xl mb-2">🔍</div>
+                <p className="text-sm">Select a prospect to view their scouting profile.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === 'fa' && (
+        <div>
+          {!freeAgents || freeAgents.length === 0 ? (
+            <div className="text-gray-500 text-sm text-center p-8">No free agents available.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {freeAgents.slice(0, 20).map(fa => (
+                <FreeAgentScoutCard
+                  key={fa.id}
+                  player={fa}
+                  scoutData={scouting.scoutedPlayers?.[fa.id]}
+                  tokens={tokens}
+                  onScout={onScoutFA}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'reports' && (
+        <div className="space-y-3">
+          {allReports.length === 0 ? (
+            <div className="text-gray-500 text-sm text-center p-8">No scout reports yet. Scout some players to generate reports.</div>
+          ) : (
+            allReports.map((r, i) => (
+              <div key={i} className="bg-gray-800 rounded-xl border border-gray-700 p-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <ScoutBadge scoutLevel={r.level} />
+                  <span className="text-gray-500 text-xs capitalize">{r.playerType}</span>
+                </div>
+                <div className="text-gray-300 text-sm italic">"{r.text}"</div>
+                {r.comparable && <div className="text-blue-300 text-xs mt-1">Comparable: {r.comparable}</div>}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 // ============================================================
 // PHASE 9C-D — UI COMPONENTS
@@ -7871,18 +8887,45 @@ export default function HockeySimGame() {
     });
   }
 
-  // --- Draft Actions ---
-  function handleScoutProspect(prospectId) {
+  // --- Phase 3: Scouting Actions ---
+  function handleScoutProspect(prospectId, targetLevel = 1) {
     setLeagueState(prev => {
-      if (!prev.draftState || prev.draftState.scoutingTokens <= 0) return prev;
-      const updatedProspects = prev.draftState.prospects.map(p =>
-        p.id === prospectId ? scoutProspect(p) : p
+      const userTeam = prev.teams.find(t => t.id === USER_TEAM_ID);
+      if (!userTeam?.scouting) return prev;
+      const prospect = prev.draftState?.prospects?.find(p => p.id === prospectId);
+      if (!prospect) return prev;
+
+      const result = scoutPlayerFull(userTeam.scouting, prospect, targetLevel, true);
+      if (!result.success) return prev;
+
+      const newTeams = prev.teams.map(t =>
+        t.id === USER_TEAM_ID ? { ...t, scouting: result.newScouting } : t
       );
-      return {
-        ...prev,
-        draftState: { ...prev.draftState, prospects: updatedProspects, scoutingTokens: prev.draftState.scoutingTokens - 1 },
-      };
+      return { ...prev, teams: newTeams };
     });
+  }
+
+  function handleScoutFA(faId, targetLevel = 1, isProspect = false) {
+    setLeagueState(prev => {
+      const userTeam = prev.teams.find(t => t.id === USER_TEAM_ID);
+      if (!userTeam?.scouting) return prev;
+      const fa = prev.freeAgents?.find(p => p.id === faId);
+      if (!fa) return prev;
+
+      const result = scoutPlayerFull(userTeam.scouting, fa, targetLevel, false);
+      if (!result.success) return prev;
+
+      const newTeams = prev.teams.map(t =>
+        t.id === USER_TEAM_ID ? { ...t, scouting: result.newScouting } : t
+      );
+      return { ...prev, teams: newTeams };
+    });
+  }
+
+  // --- Draft Actions ---
+  function handleScoutProspectLegacy(prospectId) {
+    // Legacy wrapper (used by DraftDayPanel's simple 1-token flow)
+    handleScoutProspect(prospectId, 1);
   }
 
   function handleDraftPick(prospectId) {
@@ -7900,7 +8943,8 @@ export default function HockeySimGame() {
         pickedProspect = available.find(p => p.id === prospectId);
       } else {
         // AI pick
-        pickedProspect = aiDraftPick(available);
+        const pickingTeam = teams.find(t => t.id === currentPick.teamId);
+        pickedProspect = pickingTeam ? aiDraftDecisionEnhanced(pickingTeam, available) : aiDraftPick(available);
       }
       if (!pickedProspect) return prev;
 
@@ -7945,24 +8989,29 @@ export default function HockeySimGame() {
 
   // --- Start new season ---
   function handleStartNewSeason() {
-    setLeagueState(prev => ({
-      ...prev,
-      currentSeason: prev.currentSeason + 1,
-      seasonSimulated: false,
-      seasonPhase: 'preseason',
-      playoffs: null,
-      awards: null,
-      offseasonStep: null,
-      draftState: null,
-      developmentResults: null,
-      retiredThisOffseason: null,
-      offseasonSummary: null,
-      currentView: 'dashboard',
-      // Phase 9C-D: reset calendar for new season
-      seasonCalendar: null,
-      storylineTracker: initStorylineTracker(),
-      lastViewedRecap: null,
-    }));
+    setLeagueState(prev => {
+      // Phase 3: refresh scouting tokens for all teams at new season start
+      const teamsWithRefreshedTokens = prev.teams.map(t => refreshScoutingTokens(t));
+      return {
+        ...prev,
+        teams: teamsWithRefreshedTokens,
+        currentSeason: prev.currentSeason + 1,
+        seasonSimulated: false,
+        seasonPhase: 'preseason',
+        playoffs: null,
+        awards: null,
+        offseasonStep: null,
+        draftState: null,
+        developmentResults: null,
+        retiredThisOffseason: null,
+        offseasonSummary: null,
+        currentView: 'dashboard',
+        // Phase 9C-D: reset calendar for new season
+        seasonCalendar: null,
+        storylineTracker: initStorylineTracker(),
+        lastViewedRecap: null,
+      };
+    });
   }
 
   // --- Trades / FA / Sign / Release (same as before) ---
@@ -8031,6 +9080,7 @@ export default function HockeySimGame() {
     { key: 'leagueStrategy', label: 'League Strats', icon: '📋' },
     { key: 'trades', label: 'Trades', icon: '🔄', locked: mgmtLocked || inOffseason },
     { key: 'freeAgency', label: 'Free Agency', icon: '✍️', locked: mgmtLocked || inOffseason },
+    { key: 'scouting', label: 'Scouting', icon: '🔍' },
     { key: 'injuries', label: 'Injuries', icon: '🏥' },
     { key: 'awards', label: 'Awards', icon: '🏆', show: seasonSimulated },
     { key: 'playoffs', label: 'Playoffs', icon: '🥊', show: seasonSimulated || playoffs?.active },
@@ -8132,6 +9182,15 @@ export default function HockeySimGame() {
         {(currentView === 'trades' && (mgmtLocked || inOffseason)) && <div className="p-8 text-center text-orange-400">🔒 Trades are locked.</div>}
         {currentView === 'freeAgency' && !mgmtLocked && !inOffseason && <FreeAgencyView teams={teams} freeAgents={freeAgents} onSign={handleSign} onRelease={handleRelease} />}
         {(currentView === 'freeAgency' && (mgmtLocked || inOffseason)) && <div className="p-8 text-center text-orange-400">🔒 Free agency is locked.</div>}
+        {currentView === 'scouting' && (
+          <ScoutingHubView
+            userTeam={teams.find(t => t.id === USER_TEAM_ID) || teams[0]}
+            freeAgents={freeAgents}
+            draftState={draftState}
+            onScout={handleScoutProspect}
+            onScoutFA={handleScoutFA}
+          />
+        )}
         {currentView === 'injuries' && <InjuryReportView teams={teams} />}
         {currentView === 'awards' && (
           <AwardsCeremonyView
@@ -8193,6 +9252,7 @@ export default function HockeySimGame() {
             onSign={handleSign}
             onRelease={handleRelease}
             onStartNewSeason={handleStartNewSeason}
+            userTeamScouting={teams.find(t => t.id === USER_TEAM_ID)?.scouting}
           />
         )}
       </main>
