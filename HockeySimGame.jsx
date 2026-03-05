@@ -397,14 +397,17 @@ function generateTeam(teamDef, usedNames) {
     const p = generatePlayer(slot.pos, role, targetOvr, slot.line, slot.isExtra, teamDef.id, usedNames);
     players.push(p);
   }
-  return {
+  const teamObj = {
     ...teamDef,
     players,
     seasonStats: { GP:0,W:0,L:0,OTL:0,GF:0,GA:0,PPG:0,PPO:0,PKG_against:0,PKO:0,SF:0,SA:0 },
     playoffStats: { GP:0,W:0,L:0,GF:0,GA:0,PPG:0,PPO:0,PKG_against:0,PKO:0 },
     injuredReserve: [],
     dayToDay: [],
+    strategy: null, // set after generation
   };
+  teamObj.strategy = buildDefaultStrategy(teamObj);
+  return teamObj;
 }
 
 function generateLeague() {
@@ -493,6 +496,237 @@ function getDefensePairChemistry(p1, p2) {
   return 1.0;
 }
 
+
+// ============================================================
+// PHASE 6B — TEAM STRATEGY CONSTANTS
+// ============================================================
+
+const STRATEGY_META = {
+  offensive: { label:'Offensive', icon:'⚔️', color:'#ef4444',
+    desc:'Push the pace. More shots, more chances — both ways.' },
+  defensive: { label:'Defensive', icon:'🛡️', color:'#3b82f6',
+    desc:'Lock it down. Fewer chances against, fewer generated.' },
+  balanced:  { label:'Balanced',  icon:'⚖️', color:'#a855f7',
+    desc:'No extremes. Adapts to the flow of the game.' },
+  physical:  { label:'Physical',  icon:'💥', color:'#f97316',
+    desc:'Impose your will. Heavy hits, intimidation, more penalties.' },
+};
+
+const STRATEGY_MODIFIERS = {
+  offensive: { shotGeneration:1.18, shotQuality:1.08, defensiveEfficiency:0.88,
+    penaltyDrawRate:1.05, penaltyTakeRate:0.97, hitRate:0.90, fatigueRate:1.08, turnoverRate:1.06 },
+  defensive: { shotGeneration:0.86, shotQuality:0.94, defensiveEfficiency:1.15,
+    penaltyDrawRate:0.94, penaltyTakeRate:1.04, hitRate:1.05, fatigueRate:0.92, turnoverRate:0.90 },
+  balanced:  { shotGeneration:1.00, shotQuality:1.00, defensiveEfficiency:1.00,
+    penaltyDrawRate:1.00, penaltyTakeRate:1.00, hitRate:1.00, fatigueRate:1.00, turnoverRate:1.00 },
+  physical:  { shotGeneration:0.96, shotQuality:0.97, defensiveEfficiency:1.05,
+    penaltyDrawRate:1.12, penaltyTakeRate:1.20, hitRate:1.45, fatigueRate:1.10, turnoverRate:1.03 },
+};
+
+const MATCHUP_MODIFIERS = {
+  'offensive_defensive': { home:{ shotQuality:0.94, turnoverRate:1.05 }, away:{ shotGeneration:0.95 } },
+  'offensive_offensive': { home:{ shotGeneration:1.05, defensiveEfficiency:0.95 }, away:{ shotGeneration:1.05, defensiveEfficiency:0.95 } },
+  'offensive_physical':  { home:{ shotQuality:0.96, fatigueRate:1.04 }, away:{ penaltyDrawRate:1.06 } },
+  'defensive_physical':  { home:{ shotGeneration:0.94, defensiveEfficiency:1.03 }, away:{ shotGeneration:0.94, hitRate:0.95 } },
+  'physical_physical':   { home:{ hitRate:1.10, penaltyTakeRate:1.10 }, away:{ hitRate:1.10, penaltyTakeRate:1.10 } },
+  'defensive_defensive': { home:{ shotGeneration:0.92, shotQuality:0.96 }, away:{ shotGeneration:0.92, shotQuality:0.96 } },
+};
+
+const PP_FORMATION_WEIGHTS = {
+  umbrella: {
+    label:'1-3-1 Umbrella', desc:'Classic setup with a quarterback at the point.',
+    keyAttributes:{ slapShotAccuracy:0.15, slapShotPower:0.12, passing:0.22, offensiveAwareness:0.18, puckControl:0.13, wristShotAccuracy:0.10, handEye:0.10 },
+    posImportance:{ ld:1.3, rd:1.1, c:1.1, lw:1.0, rw:1.0 },
+  },
+  overload: {
+    label:'Overload', desc:'Stack one side; move puck quickly.',
+    keyAttributes:{ passing:0.25, wristShotAccuracy:0.18, offensiveAwareness:0.20, puckControl:0.15, speed:0.07, handEye:0.08, slapShotAccuracy:0.07 },
+    posImportance:{ lw:1.2, c:1.1, rw:1.0, ld:1.1, rd:1.0 },
+  },
+  behind_the_net: {
+    label:'Behind the Net', desc:'Center works behind net as distributor.',
+    keyAttributes:{ passing:0.20, puckControl:0.18, strength:0.12, offensiveAwareness:0.18, wristShotAccuracy:0.12, balance:0.08, handEye:0.07, slapShotAccuracy:0.05 },
+    posImportance:{ c:1.4, lw:1.1, rw:1.1, ld:1.0, rd:0.9 },
+  },
+};
+
+const PK_FORMATION_WEIGHTS = {
+  box: {
+    label:'Box (Passive)', desc:'Protect the middle; force outside shots.',
+    keyAttributes:{ defensiveAwareness:0.28, stickChecking:0.22, shotBlocking:0.20, bodyChecking:0.10, discipline:0.10, speed:0.10 },
+    shgMultiplier:0.70, safetyRating:1.10,
+  },
+  diamond: {
+    label:'Diamond (Hybrid)', desc:'1-2-1 shape; one forward pressures high.',
+    keyAttributes:{ defensiveAwareness:0.24, stickChecking:0.20, speed:0.18, shotBlocking:0.14, offensiveAwareness:0.10, bodyChecking:0.08, discipline:0.06 },
+    shgMultiplier:1.00, safetyRating:1.00,
+  },
+  aggressive: {
+    label:'Aggressive', desc:'Heavy pressure on puck carrier. High risk, high reward.',
+    keyAttributes:{ speed:0.24, stickChecking:0.22, defensiveAwareness:0.18, offensiveAwareness:0.14, bodyChecking:0.12, shotBlocking:0.05, discipline:0.05 },
+    shgMultiplier:1.40, safetyRating:0.88,
+  },
+};
+
+// ── Strategy Helpers ────────────────────────────────────────
+
+function getMatchupModifiers(homeStrat, awayStrat) {
+  const key = `${homeStrat}_${awayStrat}`;
+  if (MATCHUP_MODIFIERS[key]) return MATCHUP_MODIFIERS[key];
+  const rev = `${awayStrat}_${homeStrat}`;
+  if (MATCHUP_MODIFIERS[rev]) return { home: MATCHUP_MODIFIERS[rev].away || {}, away: MATCHUP_MODIFIERS[rev].home || {} };
+  return { home:{}, away:{} };
+}
+
+function mergeStratMods(base, extra) {
+  const out = { ...base };
+  for (const [k,v] of Object.entries(extra)) {
+    if (typeof out[k] === 'number') out[k] *= v; else out[k] = v;
+  }
+  return out;
+}
+
+function composeGameStratMods(team, opponent) {
+  const strat = team.strategy?.fiveOnFive || 'balanced';
+  const oppStrat = opponent.strategy?.fiveOnFive || 'balanced';
+  const base = { ...(STRATEGY_MODIFIERS[strat] || STRATEGY_MODIFIERS.balanced) };
+  const matchup = getMatchupModifiers(strat, oppStrat);
+  const myMatchupMods = team === team ? matchup.home : matchup.away; // team is always "home" perspective
+  return mergeStratMods(base, myMatchupMods);
+}
+
+function getIceTimeWeight(player) {
+  if (player.position === 'G') return 0;
+  const isD = ['LD','RD'].includes(player.position);
+  const line = player.lineNumber || 4;
+  const fwdWeights = { 1:1.0, 2:0.8, 3:0.6, 4:0.4 };
+  const defWeights = { 1:1.0, 2:0.8, 3:0.6 };
+  return (isD ? defWeights : fwdWeights)[line] || 0.4;
+}
+
+function calculatePPScore(player) {
+  if (player.position === 'G') return -Infinity;
+  const a = player.attributes;
+  let score = (a.wristShotAccuracy||50)*0.15 + (a.slapShotAccuracy||50)*0.12 +
+    (a.slapShotPower||50)*0.08 + (a.passing||50)*0.20 + (a.offensiveAwareness||50)*0.18 +
+    (a.puckControl||50)*0.15 + (a.handEye||50)*0.07 + (a.speed||50)*0.05;
+  const isD = ['LD','RD'].includes(player.position);
+  if (isD) score += ((a.slapShotPower||50) + (a.slapShotAccuracy||50)) * 0.05;
+  const roleBonus = { 'Sniper':1.08,'Playmaker':1.10,'Offensive Defenseman':1.06,'Two-Way Forward':1.00,
+    'Power Forward':1.03,'Two-Way Defenseman':0.95,'Grinder':0.85,'Enforcer':0.75,
+    'Defensive Defenseman':0.80,'Enforcer Defenseman':0.70 };
+  return score * (roleBonus[player.role] || 1.0);
+}
+
+function calculatePKScore(player) {
+  if (player.position === 'G') return -Infinity;
+  const a = player.attributes;
+  let score = (a.defensiveAwareness||50)*0.25 + (a.stickChecking||50)*0.20 +
+    (a.shotBlocking||50)*0.18 + (a.speed||50)*0.12 + (a.discipline||50)*0.10 +
+    (a.faceoffs||50)*0.08 + (a.bodyChecking||50)*0.07;
+  const roleBonus = { 'Two-Way Forward':1.12,'Grinder':1.08,'Defensive Defenseman':1.10,
+    'Two-Way Defenseman':1.06,'Enforcer':0.95,'Sniper':0.82,'Playmaker':0.88,
+    'Offensive Defenseman':0.85,'Power Forward':0.95,'Enforcer Defenseman':0.92 };
+  return score * (roleBonus[player.role] || 1.0);
+}
+
+function autoGeneratePPUnits(team) {
+  const healthySkaters = team.players.filter(p => p.position !== 'G' && !p.isExtra && (!p.injury?.active || (p.injury?.gamesTotal||0) < 5));
+  const scored = _.orderBy(healthySkaters.map(p => ({ player:p, score:calculatePPScore(p) })), 'score', 'desc');
+  const unit1Players = scored.slice(0,5).map(s => s.player);
+  const unit2Players = scored.slice(5,10).map(s => s.player);
+  return { unit1: assignPPPositions(unit1Players), unit2: assignPPPositions(unit2Players) };
+}
+
+function assignPPPositions(players) {
+  const unit = { lw:null, c:null, rw:null, ld:null, rd:null };
+  const fwds = players.filter(p => ['LW','C','RW'].includes(p.position));
+  const defs = players.filter(p => ['LD','RD'].includes(p.position));
+  for (const d of defs) {
+    if (!unit.ld) unit.ld = d.id; else if (!unit.rd) unit.rd = d.id;
+  }
+  for (const f of fwds) {
+    if (f.position === 'C' && !unit.c) unit.c = f.id;
+    else if (f.position === 'LW' && !unit.lw) unit.lw = f.id;
+    else if (f.position === 'RW' && !unit.rw) unit.rw = f.id;
+    else {
+      if (!unit.c) unit.c = f.id;
+      else if (!unit.lw) unit.lw = f.id;
+      else if (!unit.rw) unit.rw = f.id;
+      else if (!unit.ld) unit.ld = f.id;
+      else if (!unit.rd) unit.rd = f.id;
+    }
+  }
+  return unit;
+}
+
+function autoGeneratePKUnits(team) {
+  const healthySkaters = team.players.filter(p => p.position !== 'G' && !p.isExtra && (!p.injury?.active || (p.injury?.gamesTotal||0) < 5));
+  const fwdScores = _.orderBy(healthySkaters.filter(p => ['LW','C','RW'].includes(p.position)).map(p => ({ player:p, score:calculatePKScore(p) })), 'score', 'desc');
+  const defScores = _.orderBy(healthySkaters.filter(p => ['LD','RD'].includes(p.position)).map(p => ({ player:p, score:calculatePKScore(p) })), 'score', 'desc');
+  return {
+    unit1: { f1:fwdScores[0]?.player.id, f2:fwdScores[1]?.player.id, ld:defScores[0]?.player.id, rd:defScores[1]?.player.id },
+    unit2: { f1:fwdScores[2]?.player.id, f2:fwdScores[3]?.player.id, ld:defScores[2]?.player.id, rd:defScores[3]?.player.id },
+  };
+}
+
+function calculatePPEffectiveness(team, unit, formation) {
+  if (!unit || !formation) return 1.0;
+  const fw = PP_FORMATION_WEIGHTS[formation];
+  if (!fw) return 1.0;
+  const positions = ['lw','c','rw','ld','rd'];
+  let totalScore = 0, totalWeight = 0;
+  for (const pos of positions) {
+    const pid = unit[pos]; if (!pid) continue;
+    const p = team.players.find(pl => pl.id === pid); if (!p) continue;
+    const posImp = fw.posImportance[pos] || 1.0;
+    let ps = 0;
+    for (const [attr, w] of Object.entries(fw.keyAttributes)) ps += (p.attributes[attr]||50) * w;
+    totalScore += ps * posImp; totalWeight += posImp;
+  }
+  if (!totalWeight) return 1.0;
+  const avg = totalScore / totalWeight;
+  return Math.min(1.25, Math.max(0.75, 0.60 + (avg/99)*0.70));
+}
+
+function calculatePKEffectiveness(team, unit, formation) {
+  if (!unit || !formation) return 1.0;
+  const fw = PK_FORMATION_WEIGHTS[formation];
+  if (!fw) return 1.0;
+  const players = [unit.f1, unit.f2, unit.ld, unit.rd].map(id => team.players.find(p => p.id === id)).filter(Boolean);
+  if (!players.length) return 1.0;
+  let totalScore = 0;
+  for (const p of players) {
+    let ps = 0;
+    for (const [attr, w] of Object.entries(fw.keyAttributes)) ps += (p.attributes[attr]||50) * w;
+    totalScore += ps;
+  }
+  const avg = totalScore / players.length;
+  return Math.min(1.25, Math.max(0.75, 0.60 + (avg/99)*0.70)) * (fw.safetyRating || 1.0);
+}
+
+function computePPMult(team) {
+  const pp = team.strategy?.pp;
+  if (!pp?.unit1 || !pp?.formation) return 1.0;
+  return calculatePPEffectiveness(team, pp.unit1, pp.formation);
+}
+
+function computePKMult(team) {
+  const pk = team.strategy?.pk;
+  if (!pk?.unit1 || !pk?.formation) return 1.0;
+  return calculatePKEffectiveness(team, pk.unit1, pk.formation);
+}
+
+function buildDefaultStrategy(team) {
+  const ppUnits = autoGeneratePPUnits(team);
+  const pkUnits = autoGeneratePKUnits(team);
+  return {
+    fiveOnFive: 'balanced',
+    pp: { formation:'umbrella', ...ppUnits, unit1TimeSplit:0.60, aggression:'normal' },
+    pk: { formation:'box', ...pkUnits, unit1TimeSplit:0.55 },
+  };
+}
+
 // ============================================================
 // GAME SIMULATION ENGINE
 // ============================================================
@@ -554,6 +788,15 @@ function simulateGame(homeTeamIn, awayTeamIn) {
   const awayPP = getLinePP(awayTeam);
   const homePK = getLinePK(homeTeam);
   const awayPK = getLinePK(awayTeam);
+
+  // Phase 6B: Strategy modifiers for this game
+  const homeStratMods = composeGameStratMods(homeTeam, awayTeam);
+  const awayStratMods = composeGameStratMods(awayTeam, homeTeam);
+  const homePPMult = computePPMult(homeTeam);
+  const awayPPMult = computePPMult(awayTeam);
+  const homePKMult = computePKMult(homeTeam);
+  const awayPKMult = computePKMult(awayTeam);
+  const gameIntimidation = { home: 0, away: 0 };
 
   // Precompute chemistry for lines
   const homeLineChem = homeRoster.lines.map(line => {
@@ -801,13 +1044,26 @@ function simulateGame(homeTeamIn, awayTeamIn) {
       const defFwdCenter = defFwds.find(p => p.position === 'C') || defFwds[0];
       const attFwdCenter = attFwds.find(p => p.position === 'C') || attFwds[0];
 
-      // PP/SH modifiers
-      const ppShotMod = strength === 'PP' ? 1.4 : strength === 'SH' ? 0.7 : 1.0;
-      const ppGoalMod = strength === 'PP' ? 1.25 : strength === 'SH' ? 0.8 : 1.0;
+      // PP/SH modifiers — enhanced by PP/PK unit effectiveness
+      const ppEffMult = homeHasPuck
+        ? homePPMult * (2.0 - awayPKMult)
+        : awayPPMult * (2.0 - homePKMult);
+      const ppShotMod = strength === 'PP' ? 1.4 * ppEffMult : strength === 'SH' ? 0.7 : 1.0;
+      const ppGoalMod = strength === 'PP' ? 1.25 * ppEffMult : strength === 'SH' ? 0.8 : 1.0;
+
+      // Strategy modifiers per possession (Phase 6B)
+      const attStratMods = homeHasPuck ? homeStratMods : awayStratMods;
+      const defStratMods = homeHasPuck ? awayStratMods : homeStratMods;
+      // Intimidation debuff: Physical strategy debuffs the attacker proportionally
+      const intimDebuff = gameIntimidation[defSide] > 0
+        ? Math.max(0.94, 1.0 - gameIntimidation[defSide] * 0.15)
+        : 1.0;
 
       // Roll event type
       const r = Math.random();
-      const shotChance = 0.25 * ppShotMod;
+      const shotChance = 0.25 * ppShotMod
+        * attStratMods.shotGeneration
+        * (2.0 - defStratMods.defensiveEfficiency);
       if (r < shotChance) {
         // Shot on goal
         gameStats[attSide].shots++;
@@ -836,7 +1092,7 @@ function simulateGame(homeTeamIn, awayTeamIn) {
           attrVal(attGoalie,'agility')*0.02
         ) / 99 : 0.75;
 
-        let goalProb = 0.08 * (0.5 + shooterBonus * 0.7) * (1.5 - goalieBonus * 0.7) * attLineChem * ppGoalMod;
+        let goalProb = 0.08 * (0.5 + shooterBonus * 0.7) * (1.5 - goalieBonus * 0.7) * attLineChem * ppGoalMod * attStratMods.shotQuality * intimDebuff;
         goalProb = clamp(goalProb, 0.02, 0.18);
 
         if (Math.random() < goalProb) {
@@ -861,11 +1117,18 @@ function simulateGame(homeTeamIn, awayTeamIn) {
         const defPlayer = defFwds[0] || defDefs[0];
         if (defPlayer && playerGameStats[defPlayer.id]) playerGameStats[defPlayer.id].TK++;
       } else if (r < shotChance + 0.10 + 0.10 + 0.08 + 0.12) {
-        // Hit
-        gameStats[attSide].hits++;
-        const hitter = attFwds.concat(attDefs).filter(p => attrVal(p,'bodyChecking') > 60);
-        const hitPlayer = hitter.length > 0 ? hitter[randInt(0, hitter.length-1)] : (attFwds[0] || attDefs[0]);
-        if (hitPlayer && playerGameStats[hitPlayer.id]) playerGameStats[hitPlayer.id].HIT++;
+        // Hit — scaled by hitRate strategy modifier
+        const hitRoll = Math.random();
+        if (hitRoll < attStratMods.hitRate) {
+          gameStats[attSide].hits++;
+          const hitter = attFwds.concat(attDefs).filter(p => attrVal(p,'bodyChecking') > 60);
+          const hitPlayer = hitter.length > 0 ? hitter[randInt(0, hitter.length-1)] : (attFwds[0] || attDefs[0]);
+          if (hitPlayer && playerGameStats[hitPlayer.id]) playerGameStats[hitPlayer.id].HIT++;
+          // Physical strategy builds intimidation from hits
+          if (attStratMods.hitRate >= 1.40) {
+            gameIntimidation[attSide] = Math.min(0.30, (gameIntimidation[attSide]||0) + 0.015);
+          }
+        }
       } else if (r < shotChance + 0.10 + 0.10 + 0.08 + 0.12 + 0.05) {
         // Faceoff
         const homeCenter = (homeHasPuck ? attFwdCenter : defFwdCenter);
@@ -883,15 +1146,18 @@ function simulateGame(homeTeamIn, awayTeamIn) {
           if (homeCenter && playerGameStats[homeCenter.id]) playerGameStats[homeCenter.id].FOL++;
         }
       } else if (r < shotChance + 0.10 + 0.10 + 0.08 + 0.12 + 0.05 + 0.03) {
-        // Penalty drawn
-        const penaltyPlayer = allAtt.length > 0 ? allAtt[randInt(0, allAtt.length-1)] : null;
-        if (penaltyPlayer) {
-          const penDuration = Math.random() < 0.85 ? 120 : 240; // 2 or 4 min
-          const penPIM = penDuration / 30; // convert to PIM units (2 min = 2 PIM)
-          penalties.push({ team: defSide, endTime: t + penDuration, playerId: penaltyPlayer.id });
-          gameStats[defSide].pim += penPIM;
-          gameStats[attSide].ppo++;
-          if (penaltyPlayer && playerGameStats[penaltyPlayer.id]) playerGameStats[penaltyPlayer.id].PIM += penPIM;
+        // Penalty — scaled by penaltyTakeRate (def takes it) × penaltyDrawRate (att draws it)
+        const penRate = defStratMods.penaltyTakeRate * attStratMods.penaltyDrawRate;
+        if (Math.random() < penRate) {
+          const penaltyPlayer = allAtt.length > 0 ? allAtt[randInt(0, allAtt.length-1)] : null;
+          if (penaltyPlayer) {
+            const penDuration = Math.random() < 0.85 ? 120 : 240;
+            const penPIM = penDuration / 30;
+            penalties.push({ team: defSide, endTime: t + penDuration, playerId: penaltyPlayer.id });
+            gameStats[defSide].pim += penPIM;
+            gameStats[attSide].ppo++;
+            if (penaltyPlayer && playerGameStats[penaltyPlayer.id]) playerGameStats[penaltyPlayer.id].PIM += penPIM;
+          }
         }
       }
     }
@@ -899,6 +1165,12 @@ function simulateGame(homeTeamIn, awayTeamIn) {
     // Advance line rotations
     advanceLines('home');
     advanceLines('away');
+
+    // Period-end intimidation decay (Physical strategy)
+    if (t > 0 && t % 1200 === 0) {
+      gameIntimidation.home = Math.max(0, (gameIntimidation.home||0) - 0.05);
+      gameIntimidation.away = Math.max(0, (gameIntimidation.away||0) - 0.05);
+    }
   }
 
   // --- OVERTIME ---
@@ -1039,6 +1311,13 @@ function simulateGame(homeTeamIn, awayTeamIn) {
     gameStats, scoringEvents,
     playerGameStats,
     homeGoalieId: homeGoalie?.id, awayGoalieId: awayGoalie?.id,
+    homeStrategy: homeTeam.strategy?.fiveOnFive || 'balanced',
+    awayStrategy: awayTeam.strategy?.fiveOnFive || 'balanced',
+    homePPFormation: homeTeam.strategy?.pp?.formation || 'umbrella',
+    awayPPFormation: awayTeam.strategy?.pp?.formation || 'umbrella',
+    homePKFormation: homeTeam.strategy?.pk?.formation || 'box',
+    awayPKFormation: awayTeam.strategy?.pk?.formation || 'box',
+    peakIntimidation: Math.max(gameIntimidation.home, gameIntimidation.away),
   };
 }
 
@@ -3928,6 +4207,85 @@ function InjuryReportView({ teams }) {
 
 // ============================================================
 
+
+// ============================================================
+// PHASE 6B — AI STRATEGY SELECTION
+// ============================================================
+
+function aiSelectStrategy(team) {
+  const skaters = team.players.filter(p => p.position !== 'G' && !p.isExtra);
+  if (!skaters.length) return 'balanced';
+
+  let offScore = 0, defScore = 0, phyScore = 0, balScore = 0, totalWeight = 0;
+  for (const p of skaters) {
+    const w = getIceTimeWeight(p);
+    const a = p.attributes;
+    offScore += w * ((a.offensiveAwareness||50) + (a.speed||50) + (a.wristShotAccuracy||50) + (a.passing||50)) / (4*99);
+    defScore += w * ((a.defensiveAwareness||50) + (a.stickChecking||50) + (a.shotBlocking||50) + (a.discipline||50)) / (4*99);
+    phyScore += w * ((a.bodyChecking||50) + (a.strength||50) + (a.aggression||50) + (a.fightingSkill||50)) / (4*99);
+    balScore += w * (p.overall/99);
+    totalWeight += w;
+  }
+  if (!totalWeight) return 'balanced';
+  offScore /= totalWeight; defScore /= totalWeight;
+  phyScore /= totalWeight; balScore = (balScore/totalWeight) * 1.05;
+
+  const scores = { offensive:offScore, defensive:defScore, physical:phyScore, balanced:balScore };
+  return Object.entries(scores).sort((a,b) => b[1]-a[1])[0][0];
+}
+
+function aiSelectPPFormation(team) {
+  const dmen = team.players.filter(p => ['LD','RD'].includes(p.position) && !p.isExtra);
+  const centers = team.players.filter(p => p.position === 'C' && !p.isExtra);
+  const bestD = _.maxBy(dmen, p => (p.attributes.slapShotAccuracy||50) + (p.attributes.passing||50));
+  const bestC = _.maxBy(centers, p => (p.attributes.strength||50) + (p.attributes.passing||50));
+  if (bestD && ((bestD.attributes.slapShotAccuracy||50) + (bestD.attributes.passing||50))/2 > 80) return 'umbrella';
+  if (bestC && ((bestC.attributes.strength||50) + (bestC.attributes.passing||50))/2 > 78) return 'behind_the_net';
+  return 'overload';
+}
+
+function aiSelectPKFormation(team) {
+  const skaters = team.players.filter(p => p.position !== 'G' && !p.isExtra);
+  if (!skaters.length) return 'diamond';
+  const avgSpeed = _.meanBy(skaters, p => p.attributes.speed||50);
+  const avgDef = _.meanBy(skaters, p => p.attributes.defensiveAwareness||50);
+  if (avgSpeed > 78 && avgDef > 76) return 'aggressive';
+  if (avgDef > 74) return 'box';
+  return 'diamond';
+}
+
+function initAIStrategies(teams) {
+  return teams.map((team, i) => {
+    const fiveOnFive = i === 0 ? 'balanced' : aiSelectStrategy(team); // user team stays balanced on reset
+    const ppFormation = aiSelectPPFormation(team);
+    const pkFormation = aiSelectPKFormation(team);
+    const ppUnits = autoGeneratePPUnits(team);
+    const pkUnits = autoGeneratePKUnits(team);
+    return {
+      ...team,
+      strategy: {
+        fiveOnFive,
+        pp: { formation: ppFormation, ...ppUnits, unit1TimeSplit: 0.60, aggression: 'normal' },
+        pk: { formation: pkFormation, ...pkUnits, unit1TimeSplit: 0.55 },
+      },
+    };
+  });
+}
+
+// Refresh PP/PK units at season start (roster may have changed)
+function refreshTeamPPPK(team) {
+  const ppUnits = autoGeneratePPUnits(team);
+  const pkUnits = autoGeneratePKUnits(team);
+  return {
+    ...team,
+    strategy: {
+      ...team.strategy,
+      pp: { ...(team.strategy?.pp || {}), ...ppUnits },
+      pk: { ...(team.strategy?.pk || {}), ...pkUnits },
+    },
+  };
+}
+
 // ============================================================
 // PHASE 2 — MULTI-SEASON PROGRESSION ENGINE
 // ============================================================
@@ -5209,6 +5567,453 @@ function CareerHistoryView({ history, currentSeason, teams }) {
 }
 
 
+
+// ============================================================
+// PHASE 6B — STRATEGY TAB UI
+// ============================================================
+
+function StrategyStatBar({ label, value, baseline=1.0 }) {
+  const pct = Math.round((value - 1.0) * 100);
+  const isPos = pct > 0;
+  const isNeg = pct < 0;
+  return (
+    <div className="flex items-center justify-between text-xs py-0.5">
+      <span className="text-gray-400 w-40">{label}</span>
+      <span className={`font-bold w-16 text-right ${isPos ? 'text-green-400' : isNeg ? 'text-red-400' : 'text-gray-400'}`}>
+        {isPos ? `▲ +${pct}%` : isNeg ? `▼ ${pct}%` : '— 0%'}
+      </span>
+    </div>
+  );
+}
+
+function StrategyCard({ stratKey, selected, onSelect }) {
+  const meta = STRATEGY_META[stratKey];
+  const mods = STRATEGY_MODIFIERS[stratKey];
+  const borderStyle = selected
+    ? { border: `2px solid ${meta.color}`, boxShadow: `0 0 12px ${meta.color}40` }
+    : {};
+  return (
+    <div onClick={() => onSelect(stratKey)}
+      className={`cursor-pointer rounded-xl p-4 transition select-none
+        ${selected ? 'bg-gray-800' : 'bg-gray-900 hover:bg-gray-800 border border-gray-700'}`}
+      style={borderStyle}>
+      <div className="text-2xl mb-1">{meta.icon}</div>
+      <div className="text-white font-bold text-sm mb-1">{meta.label}</div>
+      <div className="text-gray-400 text-xs mb-3 leading-tight">{meta.desc}</div>
+      <StrategyStatBar label="Shot Generation" value={mods.shotGeneration} />
+      <StrategyStatBar label="Shot Quality" value={mods.shotQuality} />
+      <StrategyStatBar label="Def. Efficiency" value={mods.defensiveEfficiency} />
+      <StrategyStatBar label="Hit Rate" value={mods.hitRate} />
+      <StrategyStatBar label="Penalty Rate" value={mods.penaltyTakeRate} />
+    </div>
+  );
+}
+
+function RosterFitBar({ team, strategy }) {
+  // Quick fit calculation (normalized)
+  const skaters = team.players.filter(p => p.position !== 'G' && !p.isExtra);
+  if (!skaters.length) return null;
+  let fitSum = 0, wSum = 0;
+  for (const p of skaters) {
+    const w = getIceTimeWeight(p);
+    const a = p.attributes;
+    let fit = 0;
+    if (strategy === 'offensive') fit = ((a.speed||50)*0.20 + (a.wristShotAccuracy||50)*0.15 + (a.slapShotAccuracy||50)*0.10 + (a.passing||50)*0.20 + (a.offensiveAwareness||50)*0.20 + (a.puckControl||50)*0.15) / 99;
+    else if (strategy === 'defensive') fit = ((a.defensiveAwareness||50)*0.25 + (a.stickChecking||50)*0.20 + (a.shotBlocking||50)*0.15 + (a.bodyChecking||50)*0.10 + (a.discipline||50)*0.15 + (a.faceoffs||50)*0.15) / 99;
+    else if (strategy === 'balanced') fit = p.overall / 99;
+    else if (strategy === 'physical') fit = ((a.bodyChecking||50)*0.25 + (a.strength||50)*0.25 + (a.aggression||50)*0.20 + (a.fightingSkill||50)*0.10 + (a.durability||50)*0.10 + (a.balance||50)*0.10) / 99;
+    fitSum += fit * w; wSum += w;
+  }
+  const normalizedFit = wSum ? fitSum / wSum : 0.5;
+  const pct = Math.round(Math.min(100, Math.max(0, (normalizedFit / 0.75) * 100)));
+  const label = pct >= 85 ? 'Excellent' : pct >= 70 ? 'Good' : pct >= 55 ? 'Average' : 'Poor';
+  const color = pct >= 85 ? '#22c55e' : pct >= 70 ? '#86efac' : pct >= 55 ? '#fbbf24' : '#f87171';
+  return (
+    <div className="mb-4">
+      <div className="flex justify-between text-xs mb-1">
+        <span className="text-gray-400">Roster Fit</span>
+        <span style={{ color }} className="font-bold">{pct}% ({label})</span>
+      </div>
+      <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
+        <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: color }} />
+      </div>
+    </div>
+  );
+}
+
+function PPUnitEditor({ team, unit, unitNum, formation, onChangePlayer }) {
+  const [openSlot, setOpenSlot] = useState(null);
+  const positions = ['lw','c','rw','ld','rd'];
+  const ppEff = calculatePPEffectiveness(team, unit, formation);
+  const effPct = Math.round((ppEff - 0.70) / (1.30 - 0.70) * 100);
+
+  const allPPScored = _.orderBy(
+    team.players.filter(p => p.position !== 'G' && !p.isExtra).map(p => ({ ...p, ppScore: Math.round(calculatePPScore(p)) })),
+    'ppScore', 'desc'
+  );
+
+  function getPlayerById(id) { return team.players.find(p => p.id === id); }
+  function isInOtherUnit(id) {
+    if (!id) return false;
+    const other = unitNum === 1 ? team.strategy?.pp?.unit2 : team.strategy?.pp?.unit1;
+    return other && Object.values(other).includes(id);
+  }
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+      <div className="flex justify-between items-center mb-3">
+        <span className="text-white font-semibold text-sm">PP Unit {unitNum}</span>
+        <span className="text-xs text-gray-400">Eff: <span className={`font-bold ${effPct >= 60 ? 'text-green-400' : effPct >= 40 ? 'text-yellow-400' : 'text-red-400'}`}>{effPct}/100</span></span>
+      </div>
+      <div className="grid grid-cols-5 gap-2 mb-2">
+        {positions.map(pos => {
+          const pid = unit?.[pos];
+          const player = pid ? getPlayerById(pid) : null;
+          const isOpen = openSlot === pos;
+          return (
+            <div key={pos} className="relative">
+              <div onClick={() => setOpenSlot(isOpen ? null : pos)}
+                className={`rounded-lg p-2 text-center cursor-pointer border transition min-h-14
+                  ${pid ? 'bg-gray-700 border-gray-600 hover:border-blue-400' : 'bg-gray-750 border-dashed border-gray-600 hover:border-gray-400'}`}>
+                <div className="text-gray-500 text-xs uppercase mb-1">{pos.toUpperCase()}</div>
+                {player ? (
+                  <>
+                    <div className="text-white text-xs font-bold leading-tight">{player.lastName}</div>
+                    <div className="text-gray-400 text-xs">{player.position} {player.overall}</div>
+                  </>
+                ) : (
+                  <div className="text-gray-600 text-xs">Empty</div>
+                )}
+              </div>
+              {isOpen && (
+                <div className="absolute z-20 top-full left-0 mt-1 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-56 max-h-48 overflow-y-auto">
+                  {allPPScored.map(p => {
+                    const inOther = isInOtherUnit(p.id);
+                    const inThis = unit && Object.entries(unit).some(([k,v]) => v === p.id && k !== pos);
+                    return (
+                      <div key={p.id}
+                        onClick={() => { if (!inThis) { onChangePlayer(unitNum, pos, p.id); setOpenSlot(null); }}}
+                        className={`px-3 py-2 text-xs flex justify-between items-center border-b border-gray-800
+                          ${inThis ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer hover:bg-gray-700'}`}>
+                        <div>
+                          <span className={`font-bold ${unit?.[pos] === p.id ? 'text-blue-300' : 'text-white'}`}>{p.firstName[0]}. {p.lastName}</span>
+                          <span className="text-gray-400 ml-1">({p.position})</span>
+                          {inOther && <span className="text-yellow-500 ml-1 text-xs">[U{unitNum===1?2:1}]</span>}
+                        </div>
+                        <div className="text-right">
+                          <div className="text-gray-300">{p.overall}</div>
+                          <div className="text-blue-400">{p.ppScore}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PKUnitEditor({ team, unit, unitNum, formation, onChangePlayer }) {
+  const [openSlot, setOpenSlot] = useState(null);
+  const positions = ['f1','f2','ld','rd'];
+  const pkEff = calculatePKEffectiveness(team, unit, formation);
+  const effPct = Math.round((pkEff - 0.70) / (1.30 - 0.70) * 100);
+
+  const allPKScored = _.orderBy(
+    team.players.filter(p => p.position !== 'G' && !p.isExtra).map(p => ({ ...p, pkScore: Math.round(calculatePKScore(p)) })),
+    'pkScore', 'desc'
+  );
+
+  function getPlayerById(id) { return team.players.find(p => p.id === id); }
+  function isInOtherUnit(id) {
+    if (!id) return false;
+    const other = unitNum === 1 ? team.strategy?.pk?.unit2 : team.strategy?.pk?.unit1;
+    return other && Object.values(other).includes(id);
+  }
+
+  return (
+    <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+      <div className="flex justify-between items-center mb-3">
+        <span className="text-white font-semibold text-sm">PK Unit {unitNum}</span>
+        <span className="text-xs text-gray-400">Eff: <span className={`font-bold ${effPct >= 60 ? 'text-green-400' : effPct >= 40 ? 'text-yellow-400' : 'text-red-400'}`}>{effPct}/100</span></span>
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        {positions.map(pos => {
+          const pid = unit?.[pos];
+          const player = pid ? getPlayerById(pid) : null;
+          const isOpen = openSlot === pos;
+          return (
+            <div key={pos} className="relative">
+              <div onClick={() => setOpenSlot(isOpen ? null : pos)}
+                className={`rounded-lg p-2 text-center cursor-pointer border transition min-h-14
+                  ${pid ? 'bg-gray-700 border-gray-600 hover:border-blue-400' : 'bg-gray-750 border-dashed border-gray-600 hover:border-gray-400'}`}>
+                <div className="text-gray-500 text-xs uppercase mb-1">{pos === 'f1' ? 'F1' : pos === 'f2' ? 'F2' : pos.toUpperCase()}</div>
+                {player ? (
+                  <>
+                    <div className="text-white text-xs font-bold leading-tight">{player.lastName}</div>
+                    <div className="text-gray-400 text-xs">{player.position} {player.overall}</div>
+                  </>
+                ) : (
+                  <div className="text-gray-600 text-xs">Empty</div>
+                )}
+              </div>
+              {isOpen && (
+                <div className="absolute z-20 top-full left-0 mt-1 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-56 max-h-48 overflow-y-auto">
+                  {allPKScored.map(p => {
+                    const inThis = unit && Object.entries(unit).some(([k,v]) => v === p.id && k !== pos);
+                    const inOther = isInOtherUnit(p.id);
+                    return (
+                      <div key={p.id}
+                        onClick={() => { if (!inThis) { onChangePlayer(unitNum, pos, p.id); setOpenSlot(null); }}}
+                        className={`px-3 py-2 text-xs flex justify-between items-center border-b border-gray-800
+                          ${inThis ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer hover:bg-gray-700'}`}>
+                        <div>
+                          <span className={`font-bold ${unit?.[pos] === p.id ? 'text-blue-300' : 'text-white'}`}>{p.firstName[0]}. {p.lastName}</span>
+                          <span className="text-gray-400 ml-1">({p.position})</span>
+                          {inOther && <span className="text-yellow-500 ml-1 text-xs">[U{unitNum===1?2:1}]</span>}
+                        </div>
+                        <div className="text-right">
+                          <div className="text-gray-300">{p.overall}</div>
+                          <div className="text-blue-400">{p.pkScore}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TimeSplitSlider({ value, onChange, label1, label2 }) {
+  const pct1 = Math.round(value * 100);
+  const pct2 = 100 - pct1;
+  return (
+    <div className="mt-3">
+      <div className="flex justify-between text-xs text-gray-400 mb-1">
+        <span>{label1}: {pct1}%</span>
+        <span>{label2}: {pct2}%</span>
+      </div>
+      <input type="range" min={50} max={80} step={5} value={pct1}
+        onChange={e => onChange(Number(e.target.value) / 100)}
+        className="w-full accent-blue-500" />
+    </div>
+  );
+}
+
+function StrategyTabView({ team, onUpdate }) {
+  const strat = team.strategy || buildDefaultStrategy(team);
+  const [section, setSection] = useState('5v5');
+
+  function handleStrategyChange(newFiveOnFive) {
+    onUpdate({ ...strat, fiveOnFive: newFiveOnFive });
+  }
+
+  function handlePPFormation(f) {
+    onUpdate({ ...strat, pp: { ...strat.pp, formation: f } });
+  }
+
+  function handlePKFormation(f) {
+    onUpdate({ ...strat, pk: { ...strat.pk, formation: f } });
+  }
+
+  function handlePPAggression(a) {
+    onUpdate({ ...strat, pp: { ...strat.pp, aggression: a } });
+  }
+
+  function handlePPUnitChange(unitNum, pos, playerId) {
+    const unitKey = `unit${unitNum}`;
+    onUpdate({ ...strat, pp: { ...strat.pp, [unitKey]: { ...strat.pp[unitKey], [pos]: playerId } } });
+  }
+
+  function handlePKUnitChange(unitNum, pos, playerId) {
+    const unitKey = `unit${unitNum}`;
+    onUpdate({ ...strat, pk: { ...strat.pk, [unitKey]: { ...strat.pk[unitKey], [pos]: playerId } } });
+  }
+
+  function handleAutoGenerate() {
+    const ppUnits = autoGeneratePPUnits(team);
+    const pkUnits = autoGeneratePKUnits(team);
+    onUpdate({ ...strat, pp: { ...strat.pp, ...ppUnits }, pk: { ...strat.pk, ...pkUnits } });
+  }
+
+  return (
+    <div className="p-4 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-white text-xl font-bold">{team.name} — Team Strategy</h2>
+        <button onClick={handleAutoGenerate}
+          className="bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs px-3 py-1.5 rounded-lg transition">
+          🔄 Auto-Generate Units
+        </button>
+      </div>
+
+      {/* Section tabs */}
+      <div className="flex gap-2 mb-5">
+        {[
+          { key:'5v5', label:'5v5 Strategy' },
+          { key:'pp', label:'Power Play' },
+          { key:'pk', label:'Penalty Kill' },
+        ].map(s => (
+          <button key={s.key} onClick={() => setSection(s.key)}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition
+              ${section===s.key ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+            {s.label}
+          </button>
+        ))}
+      </div>
+
+      {/* 5v5 Section */}
+      {section === '5v5' && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {Object.keys(STRATEGY_META).map(k => (
+              <StrategyCard key={k} stratKey={k} selected={strat.fiveOnFive === k} onSelect={handleStrategyChange} />
+            ))}
+          </div>
+          <RosterFitBar team={team} strategy={strat.fiveOnFive} />
+        </div>
+      )}
+
+      {/* PP Section */}
+      {section === 'pp' && (
+        <div className="space-y-4">
+          {/* Formation selector */}
+          <div>
+            <div className="text-gray-400 text-xs uppercase mb-2">PP Formation</div>
+            <div className="grid grid-cols-3 gap-3">
+              {Object.entries(PP_FORMATION_WEIGHTS).map(([key, fw]) => (
+                <div key={key} onClick={() => handlePPFormation(key)}
+                  className={`cursor-pointer rounded-xl p-3 border transition
+                    ${strat.pp?.formation === key ? 'bg-blue-900 border-blue-500' : 'bg-gray-800 border-gray-700 hover:border-gray-500'}`}>
+                  <div className="text-white font-semibold text-sm mb-1">{fw.label}</div>
+                  <div className="text-gray-400 text-xs">{fw.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* PP Aggression */}
+          <div>
+            <div className="text-gray-400 text-xs uppercase mb-2">PP Aggression</div>
+            <div className="flex gap-2">
+              {['conservative','normal','aggressive'].map(a => (
+                <button key={a} onClick={() => handlePPAggression(a)}
+                  className={`px-4 py-2 rounded-lg text-sm capitalize transition
+                    ${strat.pp?.aggression === a ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+                  {a}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* PP Units */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+              <PPUnitEditor team={team} unit={strat.pp?.unit1} unitNum={1} formation={strat.pp?.formation || 'umbrella'} onChangePlayer={handlePPUnitChange} />
+              <TimeSplitSlider
+                value={strat.pp?.unit1TimeSplit || 0.60}
+                onChange={v => onUpdate({ ...strat, pp: { ...strat.pp, unit1TimeSplit: v } })}
+                label1="Unit 1" label2="Unit 2"
+              />
+            </div>
+            <PPUnitEditor team={team} unit={strat.pp?.unit2} unitNum={2} formation={strat.pp?.formation || 'umbrella'} onChangePlayer={handlePPUnitChange} />
+          </div>
+        </div>
+      )}
+
+      {/* PK Section */}
+      {section === 'pk' && (
+        <div className="space-y-4">
+          {/* Formation selector */}
+          <div>
+            <div className="text-gray-400 text-xs uppercase mb-2">PK Formation</div>
+            <div className="grid grid-cols-3 gap-3">
+              {Object.entries(PK_FORMATION_WEIGHTS).map(([key, fw]) => (
+                <div key={key} onClick={() => handlePKFormation(key)}
+                  className={`cursor-pointer rounded-xl p-3 border transition
+                    ${strat.pk?.formation === key ? 'bg-blue-900 border-blue-500' : 'bg-gray-800 border-gray-700 hover:border-gray-500'}`}>
+                  <div className="text-white font-semibold text-sm mb-1">{fw.label}</div>
+                  <div className="text-gray-400 text-xs">{fw.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* PK Units */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+              <PKUnitEditor team={team} unit={strat.pk?.unit1} unitNum={1} formation={strat.pk?.formation || 'box'} onChangePlayer={handlePKUnitChange} />
+              <TimeSplitSlider
+                value={strat.pk?.unit1TimeSplit || 0.55}
+                onChange={v => onUpdate({ ...strat, pk: { ...strat.pk, unit1TimeSplit: v } })}
+                label1="Unit 1" label2="Unit 2"
+              />
+            </div>
+            <PKUnitEditor team={team} unit={strat.pk?.unit2} unitNum={2} formation={strat.pk?.formation || 'box'} onChangePlayer={handlePKUnitChange} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── League Strategy Overview ────────────────────────────────────────────────
+
+function LeagueStrategyView({ teams }) {
+  return (
+    <div className="p-4 max-w-3xl mx-auto">
+      <h2 className="text-white text-2xl font-bold mb-4">League Strategies</h2>
+      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-750 text-gray-400">
+            <tr>
+              <th className="px-4 py-3 text-left">Team</th>
+              <th className="px-4 py-3 text-center">5v5</th>
+              <th className="px-4 py-3 text-center">PP Formation</th>
+              <th className="px-4 py-3 text-center">PP Aggr.</th>
+              <th className="px-4 py-3 text-center">PK Formation</th>
+            </tr>
+          </thead>
+          <tbody>
+            {teams.map((team, i) => {
+              const s = team.strategy || {};
+              const stratMeta = STRATEGY_META[s.fiveOnFive || 'balanced'];
+              const ppFw = PP_FORMATION_WEIGHTS[s.pp?.formation || 'umbrella'];
+              const pkFw = PK_FORMATION_WEIGHTS[s.pk?.formation || 'box'];
+              return (
+                <tr key={team.id} className={`border-t border-gray-700 ${i%2===0?'bg-gray-900':'bg-gray-850'}`}>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: team.color }} />
+                      <span className="text-white font-medium">{team.name}</span>
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <span style={{ color: stratMeta?.color }} className="font-bold">
+                      {stratMeta?.icon} {stratMeta?.label}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-center text-gray-300 text-xs">{ppFw?.label || '—'}</td>
+                  <td className="px-4 py-3 text-center text-gray-300 text-xs capitalize">{s.pp?.aggression || 'normal'}</td>
+                  <td className="px-4 py-3 text-center text-gray-300 text-xs">{pkFw?.label || '—'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ============================================================
 // MAIN APP COMPONENT — PHASE 2 (MULTI-SEASON)
 // ============================================================
@@ -5251,7 +6056,8 @@ export default function HockeySimGame() {
 
   function handleRandomize() {
     if (!window.confirm('Reset ALL data including history? Continue?')) return;
-    const { teams: newTeams, freeAgents: newFAs } = generateLeague();
+    const { teams: rawTeams, freeAgents: newFAs } = generateLeague();
+    const newTeams = initAIStrategies(rawTeams);
     setLeagueState({
       teams: newTeams, freeAgents: newFAs, currentView: 'dashboard',
       seasonSimulated: false, simming: false, seasonPhase: 'preseason',
@@ -5637,12 +6443,25 @@ export default function HockeySimGame() {
     });
   }
 
+  // Phase 6B: Strategy handler
+  function handleStrategyUpdate(teamId, newStrategy) {
+    setLeagueState(prev => ({
+      ...prev,
+      teams: prev.teams.map(t => t.id === teamId ? { ...t, strategy: newStrategy } : t),
+    }));
+  }
+
+  // Determine strategy team to show (user's team = first team, BLZ)
+  const strategyTeam = teams.find(t => t.id === USER_TEAM_ID) || teams[0];
+
   const navItems = [
     { key: 'dashboard', label: 'Dashboard', icon: '🏠' },
     { key: 'roster', label: 'Rosters', icon: '👥' },
     { key: 'simGame', label: 'Sim Game', icon: '🎮' },
     { key: 'simSeason', label: 'Sim Season', icon: '📅' },
     { key: 'stats', label: 'Season Stats', icon: '📊' },
+    { key: 'strategy', label: 'Strategy', icon: '♟️' },
+    { key: 'leagueStrategy', label: 'League Strats', icon: '📋' },
     { key: 'trades', label: 'Trades', icon: '🔄', locked: mgmtLocked || inOffseason },
     { key: 'freeAgency', label: 'Free Agency', icon: '✍️', locked: mgmtLocked || inOffseason },
     { key: 'injuries', label: 'Injuries', icon: '🏥' },
@@ -5764,6 +6583,15 @@ export default function HockeySimGame() {
             currentSeason={currentSeason}
             teams={teams}
           />
+        )}
+        {currentView === 'strategy' && strategyTeam && (
+          <StrategyTabView
+            team={strategyTeam}
+            onUpdate={s => handleStrategyUpdate(strategyTeam.id, s)}
+          />
+        )}
+        {currentView === 'leagueStrategy' && (
+          <LeagueStrategyView teams={teams} />
         )}
         {currentView === 'offseason' && (
           <OffseasonWorkflowView
