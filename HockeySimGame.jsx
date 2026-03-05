@@ -309,6 +309,11 @@ function generatePlayer(position, role, targetOvr, lineNumber, isExtra, teamId, 
     overall = calculateOverall(role, attributes, isGoalie);
   }
 
+  // Phase 2: potential & development
+  const potential = assignPotential(age, overall);
+  const devRate = assignDevelopmentRate();
+  const yearsInLeague = Math.max(0, age - 18);
+
   return {
     id: uuid(),
     firstName, lastName,
@@ -325,6 +330,20 @@ function generatePlayer(position, role, targetOvr, lineNumber, isExtra, teamId, 
     rosterStatus: isExtra ? 'extra' : 'active',
     gamesPlayedSinceReturn: 0,
     goalieFatigue: 0,
+    potential,
+    scoutedPotential: Math.max(50, Math.min(99, potential + randInt(-4, 4))),
+    potentialAccuracy: 'Known',
+    peakOverall: overall,
+    developmentRate: devRate,
+    yearsInLeague,
+    isRookie: yearsInLeague === 0,
+    retired: false,
+    retiredSeason: null,
+    awardsWon: [],
+    careerStats: makeEmptySeasonStats(isGoalie),
+    careerPlayoffStats: makeEmptySeasonStats(isGoalie),
+    seasonHistory: [],
+    draftedSeason: null, draftedRound: null, draftedPick: null, draftedBy: null,
   };
 }
 
@@ -3705,7 +3724,7 @@ function AwardsCeremonyView({ awards, teams, onBeginPlayoffs }) {
 }
 
 // Championship Celebration View
-function ChampionshipView({ teams, playoffs, awards, onReturnToDash }) {
+function ChampionshipView({ teams, playoffs, awards, onReturnToDash, onBeginOffseason }) {
   if (!playoffs?.champion) return null;
   const champion = teams.find(t => t.id === playoffs.champion);
   const connSmythe = awards?.playoffs?.connSmythe?.winner;
@@ -3764,9 +3783,16 @@ function ChampionshipView({ teams, playoffs, awards, onReturnToDash }) {
           </div>
         </div>
 
-        <button onClick={onReturnToDash} className="bg-white text-gray-900 font-bold py-3 px-8 rounded-xl text-lg hover:bg-yellow-300 transition">
-          Return to Dashboard
-        </button>
+        <div className="flex gap-3 justify-center flex-wrap">
+          <button onClick={onReturnToDash} className="bg-white text-gray-900 font-bold py-3 px-8 rounded-xl text-lg hover:bg-yellow-300 transition">
+            Dashboard
+          </button>
+          {onBeginOffseason && (
+            <button onClick={onBeginOffseason} className="bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-8 rounded-xl text-lg transition">
+              Begin Offseason →
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -3901,7 +3927,1290 @@ function InjuryReportView({ teams }) {
 
 
 // ============================================================
-// MAIN APP COMPONENT
+
+// ============================================================
+// PHASE 2 — MULTI-SEASON PROGRESSION ENGINE
+// ============================================================
+
+// --- Potential Tiers ---
+const POTENTIAL_TIERS = [
+  { label: 'Franchise', min: 93, max: 99, weight: 2 },
+  { label: 'Elite',     min: 87, max: 92, weight: 6 },
+  { label: 'Top-6',     min: 83, max: 86, weight: 14 },
+  { label: 'Top-9',     min: 79, max: 82, weight: 20 },
+  { label: 'Bottom-6',  min: 74, max: 78, weight: 28 },
+  { label: 'AHL',       min: 60, max: 73, weight: 30 },
+];
+
+function getPotentialLabel(potential) {
+  for (const t of POTENTIAL_TIERS) {
+    if (potential >= t.min && potential <= t.max) return t.label;
+  }
+  return potential >= 90 ? 'Franchise' : 'AHL';
+}
+
+function assignPotential(age, overall) {
+  // Potential can't be lower than current overall; skews higher for younger players
+  const tier = weightedRand(POTENTIAL_TIERS.map(t => [t.label, t.weight]));
+  const t = POTENTIAL_TIERS.find(t => t.label === tier);
+  const base = randInt(t.min, t.max);
+  // Older players have potential closer to current overall
+  if (age >= 30) return Math.max(overall, base - 10);
+  if (age >= 27) return Math.max(overall, base - 5);
+  return Math.max(overall, base);
+}
+
+function assignDevelopmentRate() {
+  // 0.5=slow, 1.0=normal, 1.5=fast; normally distributed ~1.0
+  const r = Math.random();
+  if (r < 0.1) return 0.5 + Math.random() * 0.2;   // 10% slow
+  if (r < 0.2) return 0.7 + Math.random() * 0.2;   // 10% below avg
+  if (r < 0.7) return 0.9 + Math.random() * 0.2;   // 50% average
+  if (r < 0.9) return 1.1 + Math.random() * 0.2;   // 20% above avg
+  return 1.3 + Math.random() * 0.2;                 // 10% fast
+}
+
+// --- Development Algorithm ---
+function developPlayer(player, seasonNumber) {
+  if (player.retired) return player;
+  const isGoalie = player.position === 'G';
+  const age = player.age + 1; // aging for next season
+  const { overall, potential, developmentRate } = player;
+
+  let delta = 0;
+  // Phase: growth (18-24), prime (25-29), decline (30+)
+  if (age <= 24) {
+    // Growth phase: room to potential matters
+    const room = Math.max(0, potential - overall);
+    delta = Math.round(room * 0.18 * developmentRate * (0.7 + Math.random() * 0.6));
+    delta = Math.min(delta, 4); // cap +4 per season
+  } else if (age <= 29) {
+    // Prime: slight fluctuation
+    delta = Math.round((Math.random() - 0.4) * 2 * developmentRate);
+    delta = clamp(delta, -1, 2);
+  } else if (age <= 33) {
+    // Early decline
+    delta = Math.round((Math.random() - 0.65) * 3);
+    delta = clamp(delta, -3, 1);
+  } else if (age <= 36) {
+    // Decline
+    delta = Math.round((Math.random() - 0.75) * 4);
+    delta = clamp(delta, -4, 0);
+  } else {
+    // Sharp decline
+    delta = Math.round((Math.random() - 0.85) * 5);
+    delta = clamp(delta, -5, 0);
+  }
+
+  const newOverall = clamp(overall + delta, 40, 99);
+  const newPeak = Math.max(player.peakOverall, newOverall);
+
+  // Scale attributes proportionally
+  const attrList = isGoalie ? [...GOALIE_SPECIFIC_ATTRS, ...GOALIE_SKATING_ATTRS] : SKATER_ATTRS;
+  const newAttrs = { ...player.attributes };
+  if (delta !== 0) {
+    for (const attr of attrList) {
+      const change = delta > 0 ? randInt(0, Math.min(delta, 2)) : randInt(Math.max(delta, -2), 0);
+      newAttrs[attr] = clamp(newAttrs[attr] + change, 40, 99);
+    }
+  }
+
+  return {
+    ...player,
+    age,
+    overall: newOverall,
+    attributes: newAttrs,
+    peakOverall: newPeak,
+    yearsInLeague: player.yearsInLeague + 1,
+    isRookie: false,
+  };
+}
+
+// --- Retirement System ---
+function retirementProbability(player) {
+  const { age, overall, peakOverall } = player;
+  if (age < 33) return 0;
+  const decline = Math.max(0, peakOverall - overall);
+  let base = 0;
+  if (age === 33) base = 0.02;
+  else if (age === 34) base = 0.04;
+  else if (age === 35) base = 0.08;
+  else if (age === 36) base = 0.14;
+  else if (age === 37) base = 0.22;
+  else if (age === 38) base = 0.35;
+  else if (age === 39) base = 0.50;
+  else if (age === 40) base = 0.65;
+  else base = 0.80;
+  // Stars retire later
+  const starBonus = overall >= 87 ? -0.10 : overall >= 82 ? -0.05 : 0;
+  return clamp(base + decline * 0.005 + starBonus, 0, 0.95);
+}
+
+// --- Career stat accumulation helpers ---
+function addStatObjects(a, b) {
+  const result = { ...a };
+  for (const k of Object.keys(b)) {
+    if (typeof b[k] === 'number') result[k] = (result[k] || 0) + (b[k] || 0);
+  }
+  return result;
+}
+
+// --- Archive season for a player ---
+function archivePlayerSeason(player, season, teamName, awards) {
+  const seasonEntry = {
+    season,
+    teamName,
+    age: player.age,
+    overall: player.overall,
+    stats: { ...player.seasonStats },
+    playoffStats: { ...player.playoffStats },
+    awards: awards.filter(a => a.playerId === player.id).map(a => a.name),
+  };
+  return {
+    ...player,
+    seasonHistory: [...(player.seasonHistory || []), seasonEntry],
+    careerStats: addStatObjects(player.careerStats, player.seasonStats),
+    careerPlayoffStats: addStatObjects(player.careerPlayoffStats, player.playoffStats),
+    awardsWon: [...(player.awardsWon || []), ...seasonEntry.awards],
+  };
+}
+
+// --- Run full offseason development pass ---
+function runOffseasonDevelopment(teams, season) {
+  return teams.map(team => ({
+    ...team,
+    players: team.players.map(p => {
+      const developed = developPlayer(p, season);
+      // Reset seasonal stats, keep career
+      return {
+        ...developed,
+        seasonStats: makeEmptySeasonStats(p.position === 'G'),
+        playoffStats: makeEmptySeasonStats(p.position === 'G'),
+        gameLog: [],
+        injury: null,
+        rosterStatus: p.isExtra ? 'extra' : 'active',
+        gamesPlayedSinceReturn: 0,
+        goalieFatigue: 0,
+      };
+    }),
+    seasonStats: { GP:0,W:0,L:0,OTL:0,GF:0,GA:0,PPG:0,PPO:0,PKG_against:0,PKO:0,SF:0,SA:0 },
+    playoffStats: { GP:0,W:0,L:0,GF:0,GA:0,PPG:0,PPO:0,PKG_against:0,PKO:0 },
+    injuredReserve: [],
+    dayToDay: [],
+  }));
+}
+
+// --- Archive season for all players ---
+function archiveAllPlayerSeasons(teams, seasonNum, awards) {
+  const allAwards = awards ? [
+    ...Object.values(awards.regularSeason || {}).map(a => ({ playerId: a.winner?.id, name: a.name })),
+    awards.playoffs?.connSmythe?.winner ? { playerId: awards.playoffs.connSmythe.winner.id, name: 'Conn Smythe' } : null,
+  ].filter(Boolean) : [];
+
+  return teams.map(team => ({
+    ...team,
+    players: team.players.map(p => archivePlayerSeason(p, seasonNum, team.name, allAwards)),
+  }));
+}
+
+// --- Run retirements ---
+function runRetirements(teams, freeAgents, seasonNum) {
+  const retiredPlayers = [];
+  const newTeams = teams.map(team => {
+    const remaining = [];
+    for (const p of team.players) {
+      const prob = retirementProbability(p);
+      if (Math.random() < prob) {
+        retiredPlayers.push({ ...p, retired: true, retiredSeason: seasonNum, teamId: null });
+      } else {
+        remaining.push(p);
+      }
+    }
+    return { ...team, players: remaining };
+  });
+
+  // FAs can also retire
+  const remainingFAs = [];
+  for (const p of freeAgents) {
+    const prob = retirementProbability(p);
+    if (Math.random() < prob) {
+      retiredPlayers.push({ ...p, retired: true, retiredSeason: seasonNum, teamId: null });
+    } else {
+      remainingFAs.push(p);
+    }
+  }
+
+  return { teams: newTeams, freeAgents: remainingFAs, retiredPlayers };
+}
+
+// --- Top season record tracking ---
+function computeAllTimeRecords(history) {
+  const records = {
+    mostGoals: null, mostPoints: null, mostAssists: null,
+    bestGoalieWins: null, bestSVPct: null,
+    mostWins: null, mostGoalsTeam: null,
+  };
+  for (const season of history) {
+    for (const player of season.playerSeasons || []) {
+      const pts = (player.stats.G||0) + (player.stats.A||0);
+      if (!records.mostGoals || (player.stats.G||0) > records.mostGoals.value) {
+        records.mostGoals = { player, value: player.stats.G||0, season: season.season };
+      }
+      if (!records.mostPoints || pts > records.mostPoints.value) {
+        records.mostPoints = { player, value: pts, season: season.season };
+      }
+      if (!records.mostAssists || (player.stats.A||0) > records.mostAssists.value) {
+        records.mostAssists = { player, value: player.stats.A||0, season: season.season };
+      }
+      if (player.position === 'G') {
+        const svPct = player.stats.SA > 0 ? player.stats.SV / player.stats.SA : 0;
+        if (!records.bestSVPct || svPct > records.bestSVPct.value) {
+          records.bestSVPct = { player, value: svPct, season: season.season };
+        }
+        if (!records.bestGoalieWins || (player.stats.W||0) > records.bestGoalieWins.value) {
+          records.bestGoalieWins = { player, value: player.stats.W||0, season: season.season };
+        }
+      }
+    }
+    for (const team of season.teamStandings || []) {
+      if (!records.mostWins || team.W > records.mostWins.value) {
+        records.mostWins = { team, value: team.W, season: season.season };
+      }
+      if (!records.mostGoalsTeam || team.GF > records.mostGoalsTeam.value) {
+        records.mostGoalsTeam = { team, value: team.GF, season: season.season };
+      }
+    }
+  }
+  return records;
+}
+
+// ============================================================
+// ENTRY DRAFT ENGINE
+// ============================================================
+
+const SCOUTING_REPORT_TEMPLATES = [
+  'High-end skill set, ready to contribute immediately.',
+  'Raw talent with tremendous upside if developed properly.',
+  'Smart positional player with strong two-way game.',
+  'Physical specimen who needs to refine his skating.',
+  'Elite speed and agility, shot needs work.',
+  'Cerebral player with exceptional vision and passing.',
+  'Hard-nosed competitor who plays bigger than his size.',
+  'Boom-or-bust prospect; high ceiling, inconsistent.',
+  'Safe pick, projects as a solid middle-six contributor.',
+  'Undersized but explosive; makes up for it with compete level.',
+];
+
+function generateDraftProspect(round, pick, overallPick, season, usedNames) {
+  // Prospects are 18-20 years old
+  const age = 18 + Math.floor(Math.random() * 3);
+  // Potential by round
+  const potRange = round === 1 ? { min: 79, max: 99 } : round === 2 ? { min: 72, max: 88 } : { min: 60, max: 80 };
+  const potential = randInt(potRange.min, potRange.max);
+  // Current overall much lower than potential (raw prospect)
+  const currentOvr = clamp(potential - randInt(8, 22), 45, 82);
+
+  // Pick position (random)
+  const pos = weightedRand([['LW',2],['C',3],['RW',2],['LD',2],['RD',2],['G',1]]);
+  const isGoalie = pos === 'G';
+  const role = pickRole(pos);
+  const attrList = isGoalie ? [...GOALIE_SPECIFIC_ATTRS, ...GOALIE_SKATING_ATTRS] : SKATER_ATTRS;
+
+  // Generate first/last name
+  let firstName, lastName;
+  let attempts = 0;
+  do {
+    firstName = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
+    lastName = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
+    attempts++;
+  } while (usedNames.has(`${firstName} ${lastName}`) && attempts < 20);
+  usedNames.add(`${firstName} ${lastName}`);
+
+  // Build attributes scaled to currentOvr
+  const attributes = {};
+  const tiers = ROLE_ATTR_TIERS[role] || { primary: [], secondary: [], tertiary: [] };
+  for (const attr of attrList) {
+    const tier = tiers.primary.includes(attr) ? 'primary' : tiers.secondary.includes(attr) ? 'secondary' : 'tertiary';
+    const base = tier === 'primary' ? currentOvr + randInt(0, 8) : tier === 'secondary' ? currentOvr + randInt(-4, 4) : currentOvr + randInt(-12, 0);
+    attributes[attr] = clamp(base + randInt(-3, 3), 40, 92);
+  }
+
+  // Scouting uncertainty — higher rounds have more hidden potential
+  const hiddenBonus = round === 1 ? randInt(-3, 3) : round === 2 ? randInt(-5, 6) : randInt(-8, 10);
+  const scoutedPotential = clamp(potential + hiddenBonus, 50, 99);
+  const potAccuracy = Math.abs(hiddenBonus) <= 2 ? 'Accurate' : Math.abs(hiddenBonus) <= 5 ? 'Projected' : 'Unknown';
+
+  const reportIdx = Math.floor(Math.random() * SCOUTING_REPORT_TEMPLATES.length);
+
+  return {
+    id: uuid(),
+    firstName, lastName,
+    age, position: pos, altPosition: null, role,
+    overall: currentOvr,
+    attributes,
+    potential,
+    scoutedPotential,
+    potentialAccuracy: potAccuracy,
+    scoutReport: SCOUTING_REPORT_TEMPLATES[reportIdx],
+    peakOverall: currentOvr,
+    developmentRate: assignDevelopmentRate() * 1.1, // prospects develop slightly faster
+    yearsInLeague: 0,
+    isRookie: true,
+    retired: false,
+    retiredSeason: null,
+    awardsWon: [],
+    careerStats: makeEmptySeasonStats(isGoalie),
+    careerPlayoffStats: makeEmptySeasonStats(isGoalie),
+    seasonHistory: [],
+    draftedSeason: season,
+    draftedRound: round,
+    draftedPick: pick,
+    draftedBy: null, // set when drafted
+    seasonStats: makeEmptySeasonStats(isGoalie),
+    playoffStats: makeEmptySeasonStats(isGoalie),
+    gameLog: [],
+    lineNumber: 4,
+    isExtra: true,
+    teamId: null,
+    injury: null,
+    rosterStatus: 'extra',
+    gamesPlayedSinceReturn: 0,
+    goalieFatigue: 0,
+    // Draft metadata
+    draftRound: round,
+    draftPick: pick,
+    overallPick,
+    scouted: false,
+    scoutingTokensSpent: 0,
+    centralRank: overallPick + randInt(-3, 3), // slightly random vs actual rank
+  };
+}
+
+function generateDraftClass(season, usedNames) {
+  // 6 teams × 3 rounds = 18 picks
+  const prospects = [];
+  let overall = 1;
+  for (let round = 1; round <= 3; round++) {
+    for (let pick = 1; pick <= 6; pick++) {
+      prospects.push(generateDraftProspect(round, pick, overall, season, usedNames));
+      overall++;
+    }
+  }
+  // Sort by central ranking (scouts' view)
+  return _.orderBy(prospects, p => p.centralRank);
+}
+
+// Spending a scouting token on a prospect reveals their potential more accurately
+function scoutProspect(prospect) {
+  const newAccuracy = prospect.potentialAccuracy === 'Unknown' ? 'Projected' :
+                      prospect.potentialAccuracy === 'Projected' ? 'Accurate' : 'Exact';
+  const revealedPotential = newAccuracy === 'Exact' ? prospect.potential :
+    prospect.potential + randInt(-2, 2);
+  return {
+    ...prospect,
+    scouted: true,
+    scoutingTokensSpent: (prospect.scoutingTokensSpent || 0) + 1,
+    scoutedPotential: clamp(revealedPotential, 50, 99),
+    potentialAccuracy: newAccuracy,
+  };
+}
+
+// AI draft pick for non-user teams (picks best available by scoutedPotential)
+function aiDraftPick(availableProspects) {
+  if (!availableProspects.length) return null;
+  return _.orderBy(availableProspects, p => p.scoutedPotential, 'desc')[0];
+}
+
+// Build draft order: snake draft based on reverse standings (worst team picks first)
+function buildDraftOrder(teams, currentSeason) {
+  const standings = getStandings(teams);
+  // Reverse standings: worst team picks first
+  const draftOrderTeams = [...standings].reverse();
+  const picks = [];
+  for (let round = 1; round <= 3; round++) {
+    for (let i = 0; i < draftOrderTeams.length; i++) {
+      picks.push({
+        round,
+        pick: i + 1,
+        overallPick: (round - 1) * 6 + i + 1,
+        teamId: draftOrderTeams[i].id,
+        teamName: draftOrderTeams[i].name,
+        isUserPick: draftOrderTeams[i].id === USER_TEAM_ID,
+      });
+    }
+  }
+  return picks;
+}
+
+// User team is always team index 0 (Northbrook Blizzard)
+const USER_TEAM_ID = 'BLZ';
+
+// ============================================================
+// SEASON HISTORY HELPERS
+// ============================================================
+
+function buildSeasonRecord(teams, season, awards, champion) {
+  const standings = getStandings(teams);
+  const playerSeasons = teams.flatMap(team =>
+    team.players.map(p => ({
+      ...p,
+      teamName: team.name,
+      teamId: team.id,
+    }))
+  );
+
+  return {
+    season,
+    champion: champion ? { teamId: champion.id, teamName: champion.name } : null,
+    teamStandings: standings.map(t => ({ id: t.id, name: t.name, abbr: t.abbr, ...t.seasonStats })),
+    playerSeasons,
+    awards: awards || null,
+    connSmythe: awards?.playoffs?.connSmythe?.winner || null,
+  };
+}
+
+
+// ============================================================
+// OFFSEASON WORKFLOW VIEW
+// ============================================================
+
+const OFFSEASON_STEPS = [
+  { key: 'summary',          label: 'Season Summary',     icon: '📋' },
+  { key: 'development',      label: 'Player Development', icon: '📈' },
+  { key: 'retirements',      label: 'Retirements',        icon: '👴' },
+  { key: 'draft',            label: 'Entry Draft',        icon: '🎓' },
+  { key: 'freeAgency',       label: 'Free Agency',        icon: '✍️' },
+  { key: 'rosterManagement', label: 'Roster Management',  icon: '📋' },
+  { key: 'preseasonPreview', label: 'Preseason Preview',  icon: '🏒' },
+];
+
+function OffseasonWorkflowView({
+  step, seasonNum, summary, developmentResults, retiredPlayers, draftState,
+  teams, freeAgents, awards, champion,
+  onAdvanceStep, onScoutProspect, onDraftPick, onSign, onRelease, onStartNewSeason,
+}) {
+  const stepIndex = OFFSEASON_STEPS.findIndex(s => s.key === step);
+
+  return (
+    <div className="p-4 max-w-4xl mx-auto">
+      {/* Step Progress Bar */}
+      <div className="flex items-center justify-between mb-6 overflow-x-auto pb-2">
+        {OFFSEASON_STEPS.map((s, i) => (
+          <div key={s.key} className="flex items-center">
+            <div className={`flex flex-col items-center ${i <= stepIndex ? 'text-blue-400' : 'text-gray-600'}`}>
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold border-2
+                ${i < stepIndex ? 'bg-blue-600 border-blue-600 text-white' :
+                  i === stepIndex ? 'bg-blue-900 border-blue-400 text-blue-300' :
+                  'bg-gray-800 border-gray-700 text-gray-600'}`}>
+                {i < stepIndex ? '✓' : s.icon}
+              </div>
+              <span className="text-xs mt-1 hidden sm:block">{s.label}</span>
+            </div>
+            {i < OFFSEASON_STEPS.length - 1 && (
+              <div className={`h-0.5 w-6 sm:w-12 mx-1 ${i < stepIndex ? 'bg-blue-600' : 'bg-gray-700'}`} />
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Step Content */}
+      {step === 'summary' && (
+        <OffseasonSummaryPanel seasonNum={seasonNum} summary={summary} awards={awards} champion={champion} teams={teams} onNext={onAdvanceStep} />
+      )}
+      {step === 'development' && (
+        <DevelopmentResultsPanel results={developmentResults} onNext={onAdvanceStep} />
+      )}
+      {step === 'retirements' && (
+        <RetirementsPanel retired={retiredPlayers} onNext={onAdvanceStep} />
+      )}
+      {step === 'draft' && (
+        <DraftDayPanel draftState={draftState} teams={teams} onScout={onScoutProspect} onPick={onDraftPick} />
+      )}
+      {step === 'freeAgency' && (
+        <OffseasonFAPanel teams={teams} freeAgents={freeAgents} onSign={onSign} onRelease={onRelease} onNext={onAdvanceStep} />
+      )}
+      {step === 'rosterManagement' && (
+        <RosterManagementPanel teams={teams} onNext={onAdvanceStep} />
+      )}
+      {step === 'preseasonPreview' && (
+        <PreseasonPreviewPanel teams={teams} seasonNum={seasonNum + 1} onStartSeason={onStartNewSeason} />
+      )}
+    </div>
+  );
+}
+
+function OffseasonSummaryPanel({ seasonNum, summary, awards, champion, teams, onNext }) {
+  const champTeam = champion ? teams.find(t => t.id === champion) : null;
+  const topScorer = summary?.topScorer;
+  const topGoals = summary?.topGoals;
+  const topGoalie = summary?.topGoalie;
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Season {seasonNum} — Recap</h2>
+      {champTeam && (
+        <div className="rounded-xl p-4 text-center" style={{ backgroundColor: champTeam.darkColor }}>
+          <div className="text-3xl mb-1">🏆</div>
+          <div className="text-white text-xl font-bold">{champTeam.name}</div>
+          <div className="text-yellow-400 font-semibold">Champions</div>
+        </div>
+      )}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {topScorer && (
+          <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+            <div className="text-gray-400 text-xs uppercase mb-1">Points Leader</div>
+            <div className="text-white font-bold">{topScorer.firstName} {topScorer.lastName}</div>
+            <div className="text-blue-300 text-sm">{(topScorer.seasonStats.G||0)+(topScorer.seasonStats.A||0)} PTS ({topScorer.seasonStats.G}G, {topScorer.seasonStats.A}A)</div>
+          </div>
+        )}
+        {topGoals && (
+          <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+            <div className="text-gray-400 text-xs uppercase mb-1">Goals Leader</div>
+            <div className="text-white font-bold">{topGoals.firstName} {topGoals.lastName}</div>
+            <div className="text-blue-300 text-sm">{topGoals.seasonStats.G} G</div>
+          </div>
+        )}
+        {topGoalie && (
+          <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+            <div className="text-gray-400 text-xs uppercase mb-1">Top Goalie</div>
+            <div className="text-white font-bold">{topGoalie.firstName} {topGoalie.lastName}</div>
+            <div className="text-blue-300 text-sm">{topGoalie.seasonStats.W}W — {fmtSVPct(topGoalie.seasonStats.SV||0, topGoalie.seasonStats.SA||0)} SV%</div>
+          </div>
+        )}
+      </div>
+      {awards?.regularSeason && (
+        <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+          <div className="text-gray-400 text-xs uppercase mb-3">Award Winners</div>
+          <div className="grid grid-cols-2 gap-2">
+            {AWARD_DEFS.map(def => {
+              const aw = awards.regularSeason[def.key];
+              if (!aw?.winner) return null;
+              return (
+                <div key={def.key} className="flex items-center gap-2 text-sm">
+                  <span>{def.icon}</span>
+                  <div>
+                    <span className="text-gray-400">{def.name}: </span>
+                    <span className="text-white font-semibold">{aw.winner.firstName} {aw.winner.lastName}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <div className="flex justify-end">
+        <button onClick={onNext} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-xl transition">
+          Player Development →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DevelopmentResultsPanel({ results, onNext }) {
+  const [filter, setFilter] = useState('all');
+  if (!results) return <div className="text-gray-400 p-8 text-center">No development data.</div>;
+  const { improved, declined, unchanged } = results;
+  const all = [...(improved||[]), ...(declined||[]), ...(unchanged||[])];
+  const filtered = filter === 'improved' ? (improved||[]) : filter === 'declined' ? (declined||[]) : all;
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Player Development</h2>
+      <div className="grid grid-cols-3 gap-3 text-center">
+        <div className="bg-green-900 border border-green-700 rounded-xl p-3">
+          <div className="text-green-300 text-2xl font-bold">{improved?.length || 0}</div>
+          <div className="text-green-400 text-xs">Improved</div>
+        </div>
+        <div className="bg-gray-800 border border-gray-700 rounded-xl p-3">
+          <div className="text-gray-300 text-2xl font-bold">{unchanged?.length || 0}</div>
+          <div className="text-gray-400 text-xs">Unchanged</div>
+        </div>
+        <div className="bg-red-900 border border-red-700 rounded-xl p-3">
+          <div className="text-red-300 text-2xl font-bold">{declined?.length || 0}</div>
+          <div className="text-red-400 text-xs">Declined</div>
+        </div>
+      </div>
+      <div className="flex gap-2">
+        {['all','improved','declined'].map(f => (
+          <button key={f} onClick={() => setFilter(f)}
+            className={`px-3 py-1 rounded-lg text-sm capitalize ${filter===f ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+            {f}
+          </button>
+        ))}
+      </div>
+      <div className="overflow-y-auto max-h-72">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-800 text-gray-400 sticky top-0">
+            <tr>
+              <th className="px-2 py-2 text-left">Player</th>
+              <th className="px-2 py-2">Team</th>
+              <th className="px-2 py-2">Age</th>
+              <th className="px-2 py-2">Old OVR</th>
+              <th className="px-2 py-2">New OVR</th>
+              <th className="px-2 py-2">Change</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((r, i) => (
+              <tr key={r.id || i} className={`border-b border-gray-800 ${i%2===0?'bg-gray-900':'bg-gray-850'}`}>
+                <td className="px-2 py-1.5 text-white">{r.firstName} {r.lastName}</td>
+                <td className="px-2 py-1.5 text-gray-400 text-center">{r.teamAbbr}</td>
+                <td className="px-2 py-1.5 text-gray-400 text-center">{r.age}</td>
+                <td className="px-2 py-1.5 text-center text-gray-300">{r.oldOvr}</td>
+                <td className="px-2 py-1.5 text-center font-bold text-white">{r.newOvr}</td>
+                <td className={`px-2 py-1.5 text-center font-bold ${r.delta > 0 ? 'text-green-400' : r.delta < 0 ? 'text-red-400' : 'text-gray-500'}`}>
+                  {r.delta > 0 ? '+' : ''}{r.delta}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex justify-end">
+        <button onClick={onNext} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-xl transition">
+          Retirements →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RetirementsPanel({ retired, onNext }) {
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Retirements</h2>
+      {(!retired || retired.length === 0) ? (
+        <div className="bg-gray-800 rounded-xl p-6 text-center border border-gray-700">
+          <div className="text-3xl mb-2">✅</div>
+          <p className="text-gray-400">No players retired this offseason.</p>
+        </div>
+      ) : (
+        <>
+          <p className="text-gray-400 text-center text-sm">{retired.length} player{retired.length!==1?'s':''} hung up the skates.</p>
+          <div className="overflow-y-auto max-h-80 space-y-2">
+            {_.orderBy(retired, 'age', 'desc').map((p, i) => (
+              <div key={p.id || i} className="bg-gray-800 rounded-xl p-3 border border-gray-700 flex justify-between items-center">
+                <div>
+                  <span className="text-white font-bold">{p.firstName} {p.lastName}</span>
+                  <span className="text-gray-400 text-sm ml-2">— {p.position} — Age {p.age}</span>
+                </div>
+                <div className="text-right text-xs">
+                  <div className="text-gray-300">OVR {p.overall} (Peak {p.peakOverall})</div>
+                  <div className="text-gray-500">{p.yearsInLeague} seasons</div>
+                  {p.awardsWon?.length > 0 && <div className="text-yellow-400">{p.awardsWon.length} award{p.awardsWon.length>1?'s':''}</div>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      <div className="flex justify-end">
+        <button onClick={onNext} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-xl transition">
+          Entry Draft →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// DRAFT DAY PANEL
+// ============================================================
+
+function DraftDayPanel({ draftState, teams, onScout, onPick }) {
+  const [selectedProspect, setSelectedProspect] = useState(null);
+  if (!draftState) return null;
+
+  const { prospects, picks, currentPickIndex, scoutingTokens, draftHistory, isComplete } = draftState;
+  const availableProspects = prospects.filter(p => !draftHistory.some(d => d.prospectId === p.id));
+  const currentPick = picks[currentPickIndex];
+  const isUserPick = currentPick?.isUserPick && !isComplete;
+
+  const potentialColor = (acc) => acc === 'Exact' ? 'text-green-400' : acc === 'Accurate' ? 'text-blue-400' : acc === 'Projected' ? 'text-yellow-400' : 'text-gray-400';
+
+  if (isComplete) {
+    return (
+      <div className="space-y-4">
+        <h2 className="text-white text-2xl font-bold text-center">Draft Complete!</h2>
+        <div className="overflow-y-auto max-h-96 space-y-2">
+          {draftHistory.map((pick, i) => {
+            const prospect = [...prospects].find(p => p.id === pick.prospectId);
+            const team = teams.find(t => t.id === pick.teamId);
+            return (
+              <div key={i} className={`bg-gray-800 rounded-lg p-3 border flex justify-between items-center
+                ${pick.isUserPick ? 'border-blue-600' : 'border-gray-700'}`}>
+                <div className="flex items-center gap-3">
+                  <span className="text-gray-500 text-xs w-14">R{pick.round} P{pick.pick}</span>
+                  <div>
+                    <span className={`font-bold ${pick.isUserPick ? 'text-blue-300' : 'text-white'}`}>
+                      {prospect?.firstName} {prospect?.lastName}
+                    </span>
+                    <span className="text-gray-400 text-sm ml-2">({prospect?.position} — {prospect?.role})</span>
+                  </div>
+                </div>
+                <div className="text-right text-xs">
+                  <div className="text-gray-400">{team?.name}</div>
+                  <div className="text-gray-300">OVR {prospect?.overall} | Pot ~{prospect?.scoutedPotential}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-white text-xl font-bold">
+          Entry Draft — Round {currentPick?.round}, Pick {currentPick?.pick}
+        </h2>
+        <div className="flex items-center gap-2">
+          <span className="text-yellow-400 text-sm">🔬 Scouting Tokens: {scoutingTokens}</span>
+        </div>
+      </div>
+
+      {/* Current pick header */}
+      <div className={`rounded-xl p-3 border ${isUserPick ? 'bg-blue-900 border-blue-600' : 'bg-gray-800 border-gray-700'}`}>
+        <div className="flex items-center justify-between">
+          <div>
+            <span className={`font-bold ${isUserPick ? 'text-blue-300' : 'text-white'}`}>
+              {currentPick?.teamName}
+            </span>
+            {isUserPick && <span className="ml-2 text-yellow-400 text-sm">← YOUR PICK</span>}
+          </div>
+          <span className="text-gray-400 text-sm">Pick #{currentPick?.overallPick}</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Prospects list */}
+        <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+          <div className="bg-gray-750 px-3 py-2 border-b border-gray-700 flex justify-between items-center">
+            <span className="text-gray-300 text-sm font-semibold">Available Prospects ({availableProspects.length})</span>
+          </div>
+          <div className="overflow-y-auto max-h-80">
+            {availableProspects.map((p, i) => (
+              <div key={p.id}
+                onClick={() => setSelectedProspect(p.id === selectedProspect ? null : p.id)}
+                className={`px-3 py-2 border-b border-gray-700 cursor-pointer hover:bg-gray-700 transition
+                  ${selectedProspect === p.id ? 'bg-gray-700 border-l-2 border-l-blue-500' : ''}`}>
+                <div className="flex justify-between items-center">
+                  <div>
+                    <span className="text-white text-sm font-bold">{p.firstName} {p.lastName}</span>
+                    <span className="text-gray-400 text-xs ml-2">{p.position} — {p.role.split(' ')[0]}</span>
+                  </div>
+                  <div className="text-right text-xs">
+                    <div className="text-gray-300">OVR {p.overall}</div>
+                    <div className={potentialColor(p.potentialAccuracy)}>Pot ~{p.scoutedPotential}</div>
+                  </div>
+                </div>
+                {p.scouted && <div className="text-blue-400 text-xs mt-0.5 italic">"{p.scoutReport?.slice(0,50)}..."</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Selected prospect detail / action panel */}
+        <div className="bg-gray-800 rounded-xl border border-gray-700 p-4 min-h-40">
+          {selectedProspect ? (() => {
+            const p = availableProspects.find(pr => pr.id === selectedProspect);
+            if (!p) return null;
+            return (
+              <div className="space-y-3">
+                <div>
+                  <div className="text-white font-bold text-lg">{p.firstName} {p.lastName}</div>
+                  <div className="text-gray-400 text-sm">{p.position} — {p.role} — Age {p.age}</div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div><span className="text-gray-400">Overall: </span><span className="text-white font-bold">{p.overall}</span></div>
+                  <div><span className="text-gray-400">Potential: </span><span className={`font-bold ${potentialColor(p.potentialAccuracy)}`}>~{p.scoutedPotential} ({p.potentialAccuracy})</span></div>
+                  <div><span className="text-gray-400">Scouts rank: </span><span className="text-gray-300">#{p.centralRank}</span></div>
+                  <div><span className="text-gray-400">Dev rate: </span><span className="text-gray-300">{p.developmentRate >= 1.2 ? '⚡ Fast' : p.developmentRate >= 0.9 ? '→ Normal' : '🐢 Slow'}</span></div>
+                </div>
+                {p.scouted && <div className="text-blue-300 text-xs italic bg-gray-700 rounded-lg p-2">"{p.scoutReport}"</div>}
+                <div className="flex gap-2 flex-wrap">
+                  {isUserPick && scoutingTokens > 0 && p.potentialAccuracy !== 'Exact' && (
+                    <button onClick={() => onScout(p.id)}
+                      className="bg-yellow-700 hover:bg-yellow-600 text-white text-sm px-3 py-1.5 rounded-lg transition">
+                      🔬 Scout (1 token)
+                    </button>
+                  )}
+                  {isUserPick && (
+                    <button onClick={() => onPick(p.id)}
+                      className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm px-4 py-1.5 rounded-lg transition">
+                      Draft {p.firstName} {p.lastName}
+                    </button>
+                  )}
+                  {!isUserPick && (
+                    <button onClick={() => onPick(null)}
+                      className="bg-gray-600 hover:bg-gray-500 text-white text-sm px-4 py-1.5 rounded-lg transition">
+                      AI Pick →
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })() : (
+            <div className="text-center text-gray-500 mt-8">
+              <div className="text-2xl mb-2">👆</div>
+              <p className="text-sm">Select a prospect to view details</p>
+              {!isUserPick && (
+                <button onClick={() => onPick(null)} className="mt-4 bg-gray-700 hover:bg-gray-600 text-white text-sm px-4 py-2 rounded-lg transition">
+                  Advance (AI picks)
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Draft history */}
+      {draftHistory.length > 0 && (
+        <div className="bg-gray-900 rounded-xl p-3 border border-gray-800">
+          <div className="text-gray-400 text-xs uppercase mb-2">Recent Picks</div>
+          <div className="space-y-1">
+            {[...draftHistory].reverse().slice(0, 5).map((pick, i) => {
+              const prospect = prospects.find(p => p.id === pick.prospectId);
+              const team = teams.find(t => t.id === pick.teamId);
+              return (
+                <div key={i} className={`text-xs flex justify-between ${pick.isUserPick ? 'text-blue-300' : 'text-gray-400'}`}>
+                  <span>R{pick.round}P{pick.pick} — {team?.abbr}: {prospect?.firstName} {prospect?.lastName} ({prospect?.position})</span>
+                  <span>OVR {prospect?.overall}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// OFFSEASON FREE AGENCY PANEL
+// ============================================================
+
+function OffseasonFAPanel({ teams, freeAgents, onSign, onRelease, onNext }) {
+  const [selectedTeam, setSelectedTeam] = useState(USER_TEAM_ID);
+  const [sortBy, setSortBy] = useState('overall');
+  const team = teams.find(t => t.id === selectedTeam);
+  const sortedFAs = _.orderBy(freeAgents, sortBy, 'desc');
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Offseason Free Agency</h2>
+      <div className="flex items-center gap-3 flex-wrap">
+        <select value={selectedTeam} onChange={e => setSelectedTeam(e.target.value)}
+          className="bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700">
+          {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+        </select>
+        <select value={sortBy} onChange={e => setSortBy(e.target.value)}
+          className="bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700">
+          <option value="overall">Sort: Overall</option>
+          <option value="potential">Sort: Potential</option>
+          <option value="age">Sort: Age</option>
+        </select>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Free agents */}
+        <div className="bg-gray-800 rounded-xl border border-gray-700">
+          <div className="px-3 py-2 border-b border-gray-700 text-gray-300 text-sm font-semibold">
+            Free Agents ({freeAgents.length})
+          </div>
+          <div className="overflow-y-auto max-h-72">
+            {sortedFAs.slice(0, 40).map((p, i) => (
+              <div key={p.id} className="px-3 py-2 border-b border-gray-700 flex justify-between items-center hover:bg-gray-700">
+                <div>
+                  <div className="text-white text-sm">{p.firstName} {p.lastName} <span className="text-gray-400">({p.position})</span></div>
+                  <div className="text-gray-500 text-xs">Age {p.age} — OVR {p.overall} — Pot {p.potential}</div>
+                </div>
+                <button onClick={() => onSign(selectedTeam, p.id)}
+                  className="bg-green-700 hover:bg-green-600 text-white text-xs px-2 py-1 rounded transition">
+                  Sign
+                </button>
+              </div>
+            ))}
+            {freeAgents.length === 0 && <div className="text-gray-500 text-center py-6">No free agents available.</div>}
+          </div>
+        </div>
+
+        {/* Team roster */}
+        <div className="bg-gray-800 rounded-xl border border-gray-700">
+          <div className="px-3 py-2 border-b border-gray-700 text-gray-300 text-sm font-semibold">
+            {team?.name} Roster ({team?.players.length}/23)
+          </div>
+          <div className="overflow-y-auto max-h-72">
+            {_.orderBy(team?.players || [], ['lineNumber','position']).map((p, i) => (
+              <div key={p.id} className="px-3 py-2 border-b border-gray-700 flex justify-between items-center hover:bg-gray-700">
+                <div>
+                  <div className="text-white text-sm">{p.firstName} {p.lastName} <span className="text-gray-400">({p.position})</span></div>
+                  <div className="text-gray-500 text-xs">Age {p.age} — OVR {p.overall}</div>
+                </div>
+                <button onClick={() => onRelease(selectedTeam, p.id)}
+                  className="bg-red-800 hover:bg-red-700 text-white text-xs px-2 py-1 rounded transition">
+                  Release
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="flex justify-end">
+        <button onClick={onNext} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-xl transition">
+          Roster Management →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ROSTER MANAGEMENT PANEL
+// ============================================================
+
+function RosterManagementPanel({ teams, onNext }) {
+  const [selectedTeam, setSelectedTeam] = useState(USER_TEAM_ID);
+  const team = teams.find(t => t.id === selectedTeam);
+  const playerCount = team?.players.length || 0;
+  const hasIssues = playerCount < 20 || playerCount > 23;
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Roster Management</h2>
+      <div className="flex items-center gap-3">
+        <select value={selectedTeam} onChange={e => setSelectedTeam(e.target.value)}
+          className="bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700">
+          {teams.map(t => {
+            const cnt = t.players.length;
+            const ok = cnt >= 20 && cnt <= 23;
+            return <option key={t.id} value={t.id}>{t.name} ({cnt}/23) {ok ? '✓' : '⚠️'}</option>;
+          })}
+        </select>
+        {hasIssues && <span className="text-yellow-400 text-sm">⚠️ Roster size issue</span>}
+      </div>
+      <div className="bg-gray-800 rounded-xl border border-gray-700">
+        <div className="px-3 py-2 border-b border-gray-700 text-gray-300 text-sm font-semibold">
+          {team?.name} — {playerCount} players
+        </div>
+        <div className="overflow-y-auto max-h-80">
+          {_.orderBy(team?.players || [], ['position','lineNumber']).map((p, i) => (
+            <div key={p.id} className="px-3 py-2 border-b border-gray-700 flex justify-between items-center">
+              <div>
+                <span className="text-white text-sm">{p.firstName} {p.lastName}</span>
+                <span className="text-gray-400 text-sm ml-2">({p.position}) Line {p.lineNumber} {p.isExtra ? '• Extra' : ''}</span>
+              </div>
+              <div className="text-xs text-gray-400">
+                OVR {p.overall} — Age {p.age} — Pot {p.potential}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="flex justify-end">
+        <button onClick={onNext} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-xl transition">
+          Preseason Preview →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PRESEASON PREVIEW PANEL
+// ============================================================
+
+function PreseasonPreviewPanel({ teams, seasonNum, onStartSeason }) {
+  const standings = getStandings(teams);
+  return (
+    <div className="space-y-4">
+      <h2 className="text-white text-2xl font-bold text-center">Season {seasonNum} Preview</h2>
+      <p className="text-gray-400 text-center text-sm">All rosters are set. Here are the preseason power rankings.</p>
+      <div className="space-y-2">
+        {standings.map((team, i) => {
+          const avgOvr = Math.round(_.meanBy(team.players.filter(p => !p.isExtra), 'overall'));
+          const topPlayer = _.maxBy(team.players, 'overall');
+          return (
+            <div key={team.id} className="bg-gray-800 rounded-xl p-4 border border-gray-700 flex items-center gap-4">
+              <div className="text-gray-400 text-lg font-bold w-6">{i+1}</div>
+              <div className="w-3 h-8 rounded" style={{ backgroundColor: team.color }} />
+              <div className="flex-1">
+                <div className="text-white font-bold">{team.name}</div>
+                <div className="text-gray-400 text-xs">Best: {topPlayer?.firstName} {topPlayer?.lastName} (OVR {topPlayer?.overall})</div>
+              </div>
+              <div className="text-right">
+                <div className="text-blue-300 font-bold">{avgOvr}</div>
+                <div className="text-gray-500 text-xs">Avg OVR</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex justify-center mt-6">
+        <button onClick={onStartSeason}
+          className="bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-8 rounded-xl text-lg transition">
+          🏒 Start Season {seasonNum}!
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// CAREER HISTORY VIEW
+// ============================================================
+
+function CareerHistoryView({ history, currentSeason, teams }) {
+  const [tab, setTab] = useState('standings');
+  const [selectedSeason, setSelectedSeason] = useState(history.seasons.length > 0 ? history.seasons[history.seasons.length - 1].season : null);
+
+  const seasonData = history.seasons.find(s => s.season === selectedSeason);
+  const records = computeAllTimeRecords(history.seasons);
+
+  const allRetired = history.retiredPlayers || [];
+  const allDraftHistory = history.draftHistory || [];
+
+  return (
+    <div className="p-4 max-w-5xl mx-auto">
+      <h2 className="text-white text-2xl font-bold mb-4">History — Season {currentSeason}</h2>
+
+      {/* Tabs */}
+      <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
+        {[
+          { key: 'standings', label: '🏆 Standings' },
+          { key: 'records', label: '📊 Records' },
+          { key: 'retired', label: '👴 Retired' },
+          { key: 'draft', label: '🎓 Draft History' },
+        ].map(t => (
+          <button key={t.key} onClick={() => setTab(t.key)}
+            className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition
+              ${tab === t.key ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Season selector */}
+      {(tab === 'standings') && history.seasons.length > 0 && (
+        <div className="flex items-center gap-3 mb-4">
+          <label className="text-gray-400 text-sm">Season:</label>
+          <select value={selectedSeason || ''} onChange={e => setSelectedSeason(Number(e.target.value))}
+            className="bg-gray-800 text-white rounded-lg px-3 py-1.5 text-sm border border-gray-700">
+            {history.seasons.map(s => (
+              <option key={s.season} value={s.season}>Season {s.season}{s.champion ? ` — 🏆 ${s.champion.teamName}` : ''}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* STANDINGS TAB */}
+      {tab === 'standings' && (
+        <div className="space-y-4">
+          {history.seasons.length === 0 ? (
+            <div className="bg-gray-800 rounded-xl p-8 text-center text-gray-500">
+              No completed seasons yet. Simulate your first season to build history!
+            </div>
+          ) : seasonData ? (
+            <>
+              {seasonData.champion && (
+                <div className="bg-yellow-900 border border-yellow-600 rounded-xl p-4 text-center">
+                  <div className="text-2xl mb-1">🏆</div>
+                  <div className="text-yellow-400 font-bold">Season {seasonData.season} Champions: {seasonData.champion.teamName}</div>
+                </div>
+              )}
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-800 text-gray-400">
+                    <tr>
+                      <th className="px-2 py-2 text-left">Team</th>
+                      <th className="px-2 py-2">GP</th>
+                      <th className="px-2 py-2">W</th>
+                      <th className="px-2 py-2">L</th>
+                      <th className="px-2 py-2">OTL</th>
+                      <th className="px-2 py-2">PTS</th>
+                      <th className="px-2 py-2">GF</th>
+                      <th className="px-2 py-2">GA</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {_.orderBy(seasonData.teamStandings, t => (t.W||0)*2+(t.OTL||0), 'desc').map((team, i) => (
+                      <tr key={team.id} className={`border-b border-gray-800 ${i%2===0?'bg-gray-900':'bg-gray-850'}`}>
+                        <td className="px-2 py-1.5">
+                          <div className="flex items-center gap-2">
+                            {seasonData.champion?.teamId === team.id && <span className="text-yellow-400">🏆</span>}
+                            <span className="text-white font-semibold">{team.name}</span>
+                          </div>
+                        </td>
+                        <td className="px-2 py-1.5 text-center text-gray-400">{team.GP}</td>
+                        <td className="px-2 py-1.5 text-center text-white">{team.W}</td>
+                        <td className="px-2 py-1.5 text-center text-gray-400">{team.L}</td>
+                        <td className="px-2 py-1.5 text-center text-gray-400">{team.OTL}</td>
+                        <td className="px-2 py-1.5 text-center font-bold text-blue-300">{(team.W||0)*2+(team.OTL||0)}</td>
+                        <td className="px-2 py-1.5 text-center text-gray-300">{team.GF}</td>
+                        <td className="px-2 py-1.5 text-center text-gray-300">{team.GA}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Season award winners */}
+              {seasonData.awards?.regularSeason && (
+                <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+                  <div className="text-gray-400 text-xs uppercase mb-3">Award Winners</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {AWARD_DEFS.map(def => {
+                      const aw = seasonData.awards.regularSeason[def.key];
+                      if (!aw?.winner) return null;
+                      return (
+                        <div key={def.key} className="flex items-center gap-2 text-xs">
+                          <span>{def.icon}</span>
+                          <span className="text-gray-400">{def.name}:</span>
+                          <span className="text-white">{aw.winner.firstName} {aw.winner.lastName}</span>
+                        </div>
+                      );
+                    })}
+                    {seasonData.awards?.playoffs?.connSmythe?.winner && (
+                      <div className="flex items-center gap-2 text-xs">
+                        <span>🥇</span>
+                        <span className="text-gray-400">Conn Smythe:</span>
+                        <span className="text-white">{seasonData.awards.playoffs.connSmythe.winner.firstName} {seasonData.awards.playoffs.connSmythe.winner.lastName}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="text-gray-500 text-center py-6">Select a season above.</div>
+          )}
+        </div>
+      )}
+
+      {/* RECORDS TAB */}
+      {tab === 'records' && (
+        <div className="space-y-3">
+          {history.seasons.length === 0 ? (
+            <div className="bg-gray-800 rounded-xl p-8 text-center text-gray-500">No history yet.</div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {[
+                { label: 'Most Points (Season)', rec: records.mostPoints, fmt: r => `${r.value} PTS` },
+                { label: 'Most Goals (Season)', rec: records.mostGoals, fmt: r => `${r.value} G` },
+                { label: 'Most Assists (Season)', rec: records.mostAssists, fmt: r => `${r.value} A` },
+                { label: 'Most Goalie Wins', rec: records.bestGoalieWins, fmt: r => `${r.value} W` },
+                { label: 'Best Save Pct', rec: records.bestSVPct, fmt: r => `.${Math.round(r.value*1000)}` },
+                { label: 'Most Team Wins', rec: records.mostWins, fmt: r => `${r.value} W` },
+                { label: 'Most Team Goals', rec: records.mostGoalsTeam, fmt: r => `${r.value} GF` },
+              ].map(({ label, rec, fmt }) => (
+                <div key={label} className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+                  <div className="text-gray-400 text-xs uppercase mb-1">{label}</div>
+                  {rec ? (
+                    <>
+                      <div className="text-white font-bold">
+                        {rec.player ? `${rec.player.firstName} ${rec.player.lastName}` : rec.team?.name}
+                      </div>
+                      <div className="text-blue-300 text-sm">{fmt(rec)} — Season {rec.season}</div>
+                    </>
+                  ) : <div className="text-gray-600 text-sm">No data yet</div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* RETIRED TAB */}
+      {tab === 'retired' && (
+        <div className="space-y-2">
+          {allRetired.length === 0 ? (
+            <div className="bg-gray-800 rounded-xl p-8 text-center text-gray-500">No retired players yet.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-800 text-gray-400">
+                  <tr>
+                    <th className="px-2 py-2 text-left">Player</th>
+                    <th className="px-2 py-2">Pos</th>
+                    <th className="px-2 py-2">Retired</th>
+                    <th className="px-2 py-2">Age</th>
+                    <th className="px-2 py-2">Peak</th>
+                    <th className="px-2 py-2">Seasons</th>
+                    <th className="px-2 py-2">Career G</th>
+                    <th className="px-2 py-2">Career A</th>
+                    <th className="px-2 py-2">Awards</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {_.orderBy(allRetired, 'peakOverall', 'desc').map((p, i) => (
+                    <tr key={p.id || i} className={`border-b border-gray-800 ${i%2===0?'bg-gray-900':'bg-gray-850'}`}>
+                      <td className="px-2 py-1.5 text-white font-semibold">{p.firstName} {p.lastName}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-400">{p.position}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-400">S{p.retiredSeason}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-400">{p.age}</td>
+                      <td className="px-2 py-1.5 text-center text-blue-300 font-bold">{p.peakOverall}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-400">{p.yearsInLeague}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-300">{p.careerStats?.G || 0}</td>
+                      <td className="px-2 py-1.5 text-center text-gray-300">{p.careerStats?.A || 0}</td>
+                      <td className="px-2 py-1.5 text-center text-yellow-400">{p.awardsWon?.length || 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* DRAFT HISTORY TAB */}
+      {tab === 'draft' && (
+        <div className="space-y-4">
+          {allDraftHistory.length === 0 ? (
+            <div className="bg-gray-800 rounded-xl p-8 text-center text-gray-500">No drafts completed yet.</div>
+          ) : (
+            allDraftHistory.map((draft, di) => (
+              <div key={di} className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+                <div className="px-4 py-2 bg-gray-750 border-b border-gray-700 text-white font-semibold">
+                  Season {draft.season} Draft
+                </div>
+                <div className="divide-y divide-gray-700">
+                  {draft.picks.map((pick, i) => {
+                    const team = teams.find(t => t.id === pick.teamId);
+                    return (
+                      <div key={i} className={`px-4 py-2 flex justify-between items-center text-sm
+                        ${pick.isUserPick ? 'bg-blue-900 bg-opacity-30' : ''}`}>
+                        <div className="flex items-center gap-3">
+                          <span className="text-gray-500 text-xs w-12">R{pick.round}P{pick.pick}</span>
+                          <div>
+                            <span className={`font-bold ${pick.isUserPick ? 'text-blue-300' : 'text-white'}`}>
+                              {pick.prospectName}
+                            </span>
+                            <span className="text-gray-400 text-xs ml-2">({pick.position} — {pick.role?.split(' ')[0]})</span>
+                          </div>
+                        </div>
+                        <div className="text-right text-xs">
+                          <div className="text-gray-400">{team?.name || pick.teamName}</div>
+                          <div className="text-gray-300">OVR {pick.overall}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ============================================================
+// MAIN APP COMPONENT — PHASE 2 (MULTI-SEASON)
 // ============================================================
 
 export default function HockeySimGame() {
@@ -3912,27 +5221,48 @@ export default function HockeySimGame() {
       currentView: 'dashboard',
       seasonSimulated: false,
       simming: false,
-      seasonPhase: 'preseason',  // preseason | regularSeason | postRegularSeason | awards | playoffsSemifinals | playoffsFinals | championship | offseason
+      seasonPhase: 'preseason',
       playoffs: null,
       awards: null,
+      // Phase 2
+      currentSeason: 1,
+      history: { seasons: [], retiredPlayers: [], draftHistory: [] },
+      offseasonStep: null,
+      draftState: null,
+      developmentResults: null,
+      retiredThisOffseason: null,
+      offseasonSummary: null,
     };
   });
 
-  const { teams, freeAgents, currentView, seasonSimulated, simming, seasonPhase, playoffs, awards } = leagueState;
+  const {
+    teams, freeAgents, currentView, seasonSimulated, simming,
+    seasonPhase, playoffs, awards,
+    currentSeason, history, offseasonStep, draftState,
+    developmentResults, retiredThisOffseason, offseasonSummary,
+  } = leagueState;
 
-  // Determine if management actions are locked (during active playoffs)
   const mgmtLocked = ['playoffsSemifinals','playoffsFinals','championship'].includes(seasonPhase);
+  const inOffseason = offseasonStep !== null;
 
   function setView(v) {
     setLeagueState(prev => ({ ...prev, currentView: v }));
   }
 
   function handleRandomize() {
-    if (!window.confirm('This will reset ALL data including stats and rosters. Continue?')) return;
+    if (!window.confirm('Reset ALL data including history? Continue?')) return;
     const { teams: newTeams, freeAgents: newFAs } = generateLeague();
-    setLeagueState({ teams: newTeams, freeAgents: newFAs, currentView: 'dashboard', seasonSimulated: false, simming: false, seasonPhase: 'preseason', playoffs: null, awards: null });
+    setLeagueState({
+      teams: newTeams, freeAgents: newFAs, currentView: 'dashboard',
+      seasonSimulated: false, simming: false, seasonPhase: 'preseason',
+      playoffs: null, awards: null, currentSeason: 1,
+      history: { seasons: [], retiredPlayers: [], draftHistory: [] },
+      offseasonStep: null, draftState: null, developmentResults: null,
+      retiredThisOffseason: null, offseasonSummary: null,
+    });
   }
 
+  // --- Regular Season Simulation ---
   function handleSimSeason() {
     setLeagueState(prev => ({ ...prev, simming: true }));
     setTimeout(() => {
@@ -3947,6 +5277,7 @@ export default function HockeySimGame() {
     }, 100);
   }
 
+  // --- Playoffs ---
   function handleBeginPlayoffs() {
     const newPlayoffs = initPlayoffs(teams);
     setLeagueState(prev => ({
@@ -3957,48 +5288,32 @@ export default function HockeySimGame() {
   function advancePlayoffs(currentPlayoffs, currentTeams) {
     let pl = { ...currentPlayoffs, series: currentPlayoffs.series.map(s => ({ ...s, games: [...s.games] })) };
     let updatedTeams = currentTeams.map(t => ({ ...t, players: t.players.map(p => ({ ...p, playoffStats: { ...p.playoffStats } })), playoffStats: { ...t.playoffStats } }));
-
-    // Sim one game from the first active series
     const activeSf = pl.series.filter(s => s.status === 'active' && s.round === 'semifinals' && s.highSeed);
     const activeFin = pl.series.filter(s => s.status === 'active' && s.round === 'finals' && s.highSeed);
     const active = [...activeSf, ...activeFin];
     if (!active.length) return { pl, updatedTeams };
-
     for (const ser of active) {
       const { series: newSer, gameResult } = simSeriesGame(ser, updatedTeams);
       pl.series = pl.series.map(s => s.id === ser.id ? newSer : s);
       if (gameResult) accumulatePlayoffStats(updatedTeams, gameResult);
-      break; // sim one game at a time by default (caller loops if needed)
+      break;
     }
-
-    // Check if semifinals are done, advance to finals
     const sf1 = pl.series.find(s => s.id === 'sf1');
     const sf2 = pl.series.find(s => s.id === 'sf2');
     const fin = pl.series.find(s => s.id === 'final');
     if (sf1?.status === 'complete' && sf2?.status === 'complete' && fin?.status === 'pending') {
-      // Seed final: higher overall seed gets home ice
-      const sf1Winner = updatedTeams.find(t => t.id === sf1.winner);
-      const sf2Winner = updatedTeams.find(t => t.id === sf2.winner);
       const st = getStandings(updatedTeams);
       const sf1Seed = st.findIndex(t => t.id === sf1.winner) + 1;
       const sf2Seed = st.findIndex(t => t.id === sf2.winner) + 1;
-      const [high, low] = sf1Seed <= sf2Seed ? [sf1Winner, sf2Winner] : [sf2Winner, sf1Winner];
+      const [high, low] = sf1Seed <= sf2Seed ? [updatedTeams.find(t => t.id === sf1.winner), updatedTeams.find(t => t.id === sf2.winner)] : [updatedTeams.find(t => t.id === sf2.winner), updatedTeams.find(t => t.id === sf1.winner)];
       const [highSeed, lowSeed] = sf1Seed <= sf2Seed ? [sf1Seed, sf2Seed] : [sf2Seed, sf1Seed];
-      pl.series = pl.series.map(s => s.id === 'final' ? {
-        ...s,
-        highSeed: { teamId: high.id, teamName: high.name, seed: highSeed },
-        lowSeed:  { teamId: low.id,  teamName: low.name,  seed: lowSeed },
-        status: 'active',
-      } : s);
+      pl.series = pl.series.map(s => s.id === 'final' ? { ...s, highSeed: { teamId: high.id, teamName: high.name, seed: highSeed }, lowSeed: { teamId: low.id, teamName: low.name, seed: lowSeed }, status: 'active' } : s);
     }
-
-    // Check if final is done
     const finUpdated = pl.series.find(s => s.id === 'final');
     if (finUpdated?.status === 'complete' && finUpdated.winner && !pl.champion) {
       pl.champion = finUpdated.winner;
       pl.round = 'complete';
     }
-
     return { pl, updatedTeams };
   }
 
@@ -4020,7 +5335,6 @@ export default function HockeySimGame() {
     setLeagueState(prev => {
       let pl = prev.playoffs;
       let updatedTeams = prev.teams.map(t => ({ ...t, players: t.players.map(p => ({ ...p, playoffStats: { ...p.playoffStats } })), playoffStats: { ...t.playoffStats } }));
-      // Sim until the specified series (or any active series) is complete
       for (let i = 0; i < 7; i++) {
         const ser = pl.series.find(s => (seriesId ? s.id === seriesId : true) && s.status === 'active' && s.highSeed);
         if (!ser) break;
@@ -4029,7 +5343,6 @@ export default function HockeySimGame() {
         if (gameResult) accumulatePlayoffStats(updatedTeams, gameResult);
         if (newSer.status === 'complete') break;
       }
-      // Advance finals if semis done
       const sf1 = pl.series.find(s => s.id === 'sf1');
       const sf2 = pl.series.find(s => s.id === 'sf2');
       const fin = pl.series.find(s => s.id === 'final');
@@ -4059,11 +5372,9 @@ export default function HockeySimGame() {
     setLeagueState(prev => {
       let pl = { ...prev.playoffs, series: prev.playoffs.series.map(s => ({ ...s })) };
       let updatedTeams = prev.teams.map(t => ({ ...t, players: t.players.map(p => ({ ...p, playoffStats: { ...p.playoffStats } })), playoffStats: { ...t.playoffStats } }));
-      // Run until champion
       for (let i = 0; i < 50 && !pl.champion; i++) {
         const ser = pl.series.find(s => s.status === 'active' && s.highSeed);
         if (!ser) {
-          // Try to advance finals
           const sf1 = pl.series.find(s => s.id === 'sf1');
           const sf2 = pl.series.find(s => s.id === 'sf2');
           const fin = pl.series.find(s => s.id === 'final');
@@ -4095,10 +5406,194 @@ export default function HockeySimGame() {
     });
   }
 
+  // --- Offseason Begin: triggered from Championship screen ---
+  function handleBeginOffseason() {
+    setLeagueState(prev => {
+      const { teams: archTeams } = { teams: archiveAllPlayerSeasons(prev.teams, prev.currentSeason, prev.awards) };
+      const champion = prev.playoffs?.champion ? prev.teams.find(t => t.id === prev.playoffs.champion) : null;
+
+      // Build season summary
+      const allSkaters = archTeams.flatMap(t => t.players.filter(p => p.position !== 'G'));
+      const allGoalies = archTeams.flatMap(t => t.players.filter(p => p.position === 'G'));
+      const topScorer = _.maxBy(allSkaters, p => (p.seasonStats.G||0) + (p.seasonStats.A||0));
+      const topGoals = _.maxBy(allSkaters, p => p.seasonStats.G||0);
+      const topGoalie = _.maxBy(allGoalies, p => p.seasonStats.W||0);
+
+      const seasonRecord = buildSeasonRecord(prev.teams, prev.currentSeason, prev.awards, champion);
+      const newHistory = {
+        ...prev.history,
+        seasons: [...prev.history.seasons, seasonRecord],
+      };
+
+      return {
+        ...prev,
+        teams: archTeams,
+        history: newHistory,
+        seasonPhase: 'offseason',
+        currentView: 'offseason',
+        offseasonStep: 'summary',
+        offseasonSummary: { topScorer, topGoals, topGoalie, champion: prev.playoffs?.champion },
+      };
+    });
+  }
+
   function handleReturnToDash() {
     setLeagueState(prev => ({ ...prev, currentView: 'dashboard', seasonPhase: 'offseason' }));
   }
 
+  // --- Offseason Step Advancement ---
+  function handleAdvanceOffseasonStep() {
+    setLeagueState(prev => {
+      const currentIdx = OFFSEASON_STEPS.findIndex(s => s.key === prev.offseasonStep);
+      const nextStep = OFFSEASON_STEPS[currentIdx + 1];
+
+      if (!nextStep) return prev; // shouldn't happen
+
+      // When advancing TO development step, run the development
+      if (nextStep.key === 'development') {
+        const beforeTeams = prev.teams;
+        const afterTeams = runOffseasonDevelopment(prev.teams, prev.currentSeason);
+        // Compute development deltas
+        const improved = [], declined = [], unchanged = [];
+        for (const team of afterTeams) {
+          for (const newP of team.players) {
+            const oldP = beforeTeams.flatMap(t => t.players).find(p => p.id === newP.id);
+            if (!oldP) continue;
+            const delta = newP.overall - oldP.overall;
+            const entry = { ...newP, oldOvr: oldP.overall, newOvr: newP.overall, delta, teamAbbr: team.abbr };
+            if (delta > 0) improved.push(entry);
+            else if (delta < 0) declined.push(entry);
+            else unchanged.push(entry);
+          }
+        }
+        return { ...prev, teams: afterTeams, offseasonStep: 'development', developmentResults: { improved, declined, unchanged } };
+      }
+
+      // When advancing TO retirements step
+      if (nextStep.key === 'retirements') {
+        const { teams: teamsAfterRet, freeAgents: fasAfterRet, retiredPlayers } = runRetirements(prev.teams, prev.freeAgents, prev.currentSeason);
+        const updatedHistory = {
+          ...prev.history,
+          retiredPlayers: [...prev.history.retiredPlayers, ...retiredPlayers],
+        };
+        return { ...prev, teams: teamsAfterRet, freeAgents: fasAfterRet, history: updatedHistory, offseasonStep: 'retirements', retiredThisOffseason: retiredPlayers };
+      }
+
+      // When advancing TO draft step
+      if (nextStep.key === 'draft') {
+        const usedNames = new Set(
+          [...prev.teams.flatMap(t => t.players), ...prev.freeAgents].map(p => `${p.firstName} ${p.lastName}`)
+        );
+        const prospects = generateDraftClass(prev.currentSeason, usedNames);
+        const picks = buildDraftOrder(prev.teams, prev.currentSeason);
+        return {
+          ...prev, offseasonStep: 'draft',
+          draftState: {
+            prospects,
+            picks,
+            currentPickIndex: 0,
+            scoutingTokens: 3,
+            draftHistory: [],
+            isComplete: false,
+          },
+        };
+      }
+
+      return { ...prev, offseasonStep: nextStep.key };
+    });
+  }
+
+  // --- Draft Actions ---
+  function handleScoutProspect(prospectId) {
+    setLeagueState(prev => {
+      if (!prev.draftState || prev.draftState.scoutingTokens <= 0) return prev;
+      const updatedProspects = prev.draftState.prospects.map(p =>
+        p.id === prospectId ? scoutProspect(p) : p
+      );
+      return {
+        ...prev,
+        draftState: { ...prev.draftState, prospects: updatedProspects, scoutingTokens: prev.draftState.scoutingTokens - 1 },
+      };
+    });
+  }
+
+  function handleDraftPick(prospectId) {
+    setLeagueState(prev => {
+      if (!prev.draftState) return prev;
+      const { draftState, teams } = prev;
+      const currentPick = draftState.picks[draftState.currentPickIndex];
+      if (!currentPick) return prev;
+
+      const available = draftState.prospects.filter(p => !draftState.draftHistory.some(d => d.prospectId === p.id));
+
+      // Determine which prospect is picked
+      let pickedProspect;
+      if (currentPick.isUserPick && prospectId) {
+        pickedProspect = available.find(p => p.id === prospectId);
+      } else {
+        // AI pick
+        pickedProspect = aiDraftPick(available);
+      }
+      if (!pickedProspect) return prev;
+
+      const pickRecord = {
+        round: currentPick.round,
+        pick: currentPick.pick,
+        overallPick: currentPick.overallPick,
+        teamId: currentPick.teamId,
+        teamName: currentPick.teamName,
+        prospectId: pickedProspect.id,
+        prospectName: `${pickedProspect.firstName} ${pickedProspect.lastName}`,
+        position: pickedProspect.position,
+        role: pickedProspect.role,
+        overall: pickedProspect.overall,
+        potential: pickedProspect.potential,
+        isUserPick: currentPick.isUserPick,
+      };
+
+      // Add prospect to team
+      const draftedProspect = { ...pickedProspect, teamId: currentPick.teamId, draftedBy: currentPick.teamId, isExtra: true, lineNumber: 4, rosterStatus: 'extra' };
+      const newTeams = teams.map(t => t.id === currentPick.teamId ? { ...t, players: [...t.players, draftedProspect] } : t);
+
+      const newDraftHistory = [...draftState.draftHistory, pickRecord];
+      const nextPickIndex = draftState.currentPickIndex + 1;
+      const isComplete = nextPickIndex >= draftState.picks.length;
+
+      // If draft complete, save to history
+      let newHistory = prev.history;
+      if (isComplete) {
+        const draftRecord = { season: prev.currentSeason, picks: newDraftHistory };
+        newHistory = { ...prev.history, draftHistory: [...prev.history.draftHistory, draftRecord] };
+      }
+
+      return {
+        ...prev,
+        teams: newTeams,
+        history: newHistory,
+        draftState: { ...draftState, draftHistory: newDraftHistory, currentPickIndex: nextPickIndex, isComplete },
+      };
+    });
+  }
+
+  // --- Start new season ---
+  function handleStartNewSeason() {
+    setLeagueState(prev => ({
+      ...prev,
+      currentSeason: prev.currentSeason + 1,
+      seasonSimulated: false,
+      seasonPhase: 'preseason',
+      playoffs: null,
+      awards: null,
+      offseasonStep: null,
+      draftState: null,
+      developmentResults: null,
+      retiredThisOffseason: null,
+      offseasonSummary: null,
+      currentView: 'dashboard',
+    }));
+  }
+
+  // --- Trades / FA / Sign / Release (same as before) ---
   function handleTradeComplete(teamAId, teamBId, tradeAIds, tradeBIds) {
     if (mgmtLocked) return;
     setLeagueState(prev => {
@@ -4118,7 +5613,6 @@ export default function HockeySimGame() {
   }
 
   function handleSign(teamId, faId) {
-    if (mgmtLocked) return;
     setLeagueState(prev => {
       const fa = prev.freeAgents.find(p => p.id === faId);
       if (!fa) return prev;
@@ -4133,7 +5627,6 @@ export default function HockeySimGame() {
   }
 
   function handleRelease(teamId, playerId) {
-    if (mgmtLocked) return;
     setLeagueState(prev => {
       const team = prev.teams.find(t => t.id === teamId);
       if (!team) return prev;
@@ -4150,11 +5643,13 @@ export default function HockeySimGame() {
     { key: 'simGame', label: 'Sim Game', icon: '🎮' },
     { key: 'simSeason', label: 'Sim Season', icon: '📅' },
     { key: 'stats', label: 'Season Stats', icon: '📊' },
-    { key: 'trades', label: 'Trades', icon: '🔄', locked: mgmtLocked },
-    { key: 'freeAgency', label: 'Free Agency', icon: '✍️', locked: mgmtLocked },
+    { key: 'trades', label: 'Trades', icon: '🔄', locked: mgmtLocked || inOffseason },
+    { key: 'freeAgency', label: 'Free Agency', icon: '✍️', locked: mgmtLocked || inOffseason },
     { key: 'injuries', label: 'Injuries', icon: '🏥' },
     { key: 'awards', label: 'Awards', icon: '🏆', show: seasonSimulated },
     { key: 'playoffs', label: 'Playoffs', icon: '🥊', show: seasonSimulated || playoffs?.active },
+    { key: 'history', label: 'History', icon: '📚' },
+    { key: 'offseason', label: 'Offseason', icon: '🌙', show: inOffseason },
   ];
 
   const champion = playoffs?.champion ? teams.find(t => t.id === playoffs.champion) : null;
@@ -4167,36 +5662,37 @@ export default function HockeySimGame() {
           <span className="text-2xl">🏒</span>
           <div>
             <h1 className="text-white font-bold text-lg leading-none">Hockey Sim Manager</h1>
-            <p className="text-gray-500 text-xs">6-Team Hockey Simulation League</p>
+            <div className="text-gray-400 text-xs">Season {currentSeason} — {seasonPhase.replace(/([A-Z])/g, ' $1').trim()}</div>
           </div>
         </div>
-        <div className="flex gap-2 items-center">
-          {champion && <div className="text-yellow-400 text-xs font-semibold bg-yellow-900 px-2 py-1 rounded">🏆 {champion.name}</div>}
-          {seasonSimulated && !champion && <div className="text-green-400 text-xs font-semibold bg-green-900 px-2 py-1 rounded">Season Complete</div>}
-          {mgmtLocked && <div className="text-orange-400 text-xs font-semibold bg-orange-900 px-2 py-1 rounded">🔒 Playoffs Active</div>}
+        <div className="flex items-center gap-2">
+          <span className="text-gray-500 text-xs hidden sm:block">📚 S{currentSeason} • {history.seasons.length} completed</span>
+          <button onClick={handleRandomize} className="bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs px-3 py-1.5 rounded-lg transition">
+            New League
+          </button>
         </div>
       </header>
 
-      {/* Navigation */}
-      <nav className="bg-gray-900 border-b border-gray-800 px-2 overflow-x-auto">
-        <div className="flex gap-1 py-1">
-          {navItems.filter(n => n.show !== false).map(({ key, label, icon, locked }) => (
-            <button key={key} onClick={() => !locked && setView(key)}
-              className={`px-3 py-2 rounded text-xs font-semibold whitespace-nowrap transition ${currentView === key ? 'bg-blue-700 text-white' : locked ? 'text-gray-600 cursor-not-allowed' : 'text-gray-400 hover:bg-gray-800 hover:text-white'}`}>
-              {icon} {label}
-              {locked && ' 🔒'}
-            </button>
-          ))}
-        </div>
+      {/* Nav */}
+      <nav className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1 overflow-x-auto">
+        {navItems.filter(n => n.show !== false).map(item => (
+          <button key={item.key} onClick={() => setView(item.key)}
+            className={`flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium whitespace-nowrap border-b-2 transition
+              ${currentView === item.key ? 'border-blue-500 text-white' : 'border-transparent text-gray-400 hover:text-white'}
+              ${item.locked ? 'opacity-40 cursor-not-allowed' : ''}`}
+            disabled={item.locked}>
+            {item.icon} {item.label}
+            {item.locked && <span className="text-red-400">🔒</span>}
+          </button>
+        ))}
       </nav>
 
-      {/* Simming overlay */}
       {simming && (
         <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50">
-          <div className="bg-gray-800 rounded-xl p-8 text-center">
+          <div className="bg-gray-800 rounded-2xl p-8 text-center border border-gray-700">
             <div className="text-4xl mb-4">🏒</div>
-            <div className="text-white text-xl font-bold mb-2">Simulating Season...</div>
-            <div className="text-gray-400 text-sm">Playing 246 games. This may take a moment.</div>
+            <div className="text-white text-xl font-bold mb-2">Simulating Season {currentSeason}...</div>
+            <div className="text-gray-400 text-sm">246 games in progress</div>
             <div className="mt-4 flex justify-center gap-1">
               {[0,1,2].map(i => <div key={i} className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" style={{ animationDelay: `${i*0.2}s` }} />)}
             </div>
@@ -4204,13 +5700,12 @@ export default function HockeySimGame() {
         </div>
       )}
 
-      {/* Main Content */}
       <main className="max-w-7xl mx-auto">
         {currentView === 'dashboard' && (
           <DashboardView
             teams={teams}
             seasonSimulated={seasonSimulated}
-            onSimSeason={['preseason','offseason'].includes(seasonPhase) ? handleSimSeason : null}
+            onSimSeason={['preseason','offseason'].includes(seasonPhase) && !inOffseason ? handleSimSeason : null}
             onRandomize={handleRandomize}
             onNav={setView}
             champion={champion}
@@ -4222,20 +5717,20 @@ export default function HockeySimGame() {
         {currentView === 'simGame' && <SimGameView teams={teams} />}
         {currentView === 'simSeason' && (
           <div className="p-8 text-center">
-            <h2 className="text-white text-2xl font-bold mb-4">Season Simulator</h2>
+            <h2 className="text-white text-2xl font-bold mb-4">Season {currentSeason} Simulator</h2>
             <p className="text-gray-400 mb-6">Simulate a full 82-game season for all 6 teams (246 total games).</p>
-            <button onClick={handleSimSeason} disabled={simming || !['preseason','offseason'].includes(seasonPhase)}
+            <button onClick={handleSimSeason} disabled={simming || !['preseason','offseason'].includes(seasonPhase) || inOffseason}
               className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold py-3 px-8 rounded-xl text-lg transition">
-              🏒 Drop the Puck — Simulate Full Season
+              🏒 Drop the Puck — Season {currentSeason}
             </button>
-            {seasonSimulated && <div className="mt-6 text-green-400">✓ Season simulated! View standings on Dashboard or stats in Season Stats.</div>}
+            {seasonSimulated && <div className="mt-6 text-green-400">✓ Season simulated! View standings or proceed to Awards.</div>}
           </div>
         )}
         {currentView === 'stats' && <SeasonStatsView teams={teams} seasonSimulated={seasonSimulated} />}
-        {currentView === 'trades' && !mgmtLocked && <TradeView teams={teams} onTradeComplete={handleTradeComplete} />}
-        {currentView === 'trades' && mgmtLocked && <div className="p-8 text-center text-orange-400">🔒 Trades are locked during the playoffs.</div>}
-        {currentView === 'freeAgency' && !mgmtLocked && <FreeAgencyView teams={teams} freeAgents={freeAgents} onSign={handleSign} onRelease={handleRelease} />}
-        {currentView === 'freeAgency' && mgmtLocked && <div className="p-8 text-center text-orange-400">🔒 Free agency is locked during the playoffs.</div>}
+        {currentView === 'trades' && !mgmtLocked && !inOffseason && <TradeView teams={teams} onTradeComplete={handleTradeComplete} />}
+        {(currentView === 'trades' && (mgmtLocked || inOffseason)) && <div className="p-8 text-center text-orange-400">🔒 Trades are locked.</div>}
+        {currentView === 'freeAgency' && !mgmtLocked && !inOffseason && <FreeAgencyView teams={teams} freeAgents={freeAgents} onSign={handleSign} onRelease={handleRelease} />}
+        {(currentView === 'freeAgency' && (mgmtLocked || inOffseason)) && <div className="p-8 text-center text-orange-400">🔒 Free agency is locked.</div>}
         {currentView === 'injuries' && <InjuryReportView teams={teams} />}
         {currentView === 'awards' && (
           <AwardsCeremonyView
@@ -4260,6 +5755,34 @@ export default function HockeySimGame() {
             playoffs={playoffs}
             awards={awards}
             onReturnToDash={handleReturnToDash}
+            onBeginOffseason={handleBeginOffseason}
+          />
+        )}
+        {currentView === 'history' && (
+          <CareerHistoryView
+            history={history}
+            currentSeason={currentSeason}
+            teams={teams}
+          />
+        )}
+        {currentView === 'offseason' && (
+          <OffseasonWorkflowView
+            step={offseasonStep}
+            seasonNum={currentSeason}
+            summary={offseasonSummary}
+            developmentResults={developmentResults}
+            retiredPlayers={retiredThisOffseason}
+            draftState={draftState}
+            teams={teams}
+            freeAgents={freeAgents}
+            awards={awards}
+            champion={offseasonSummary?.champion}
+            onAdvanceStep={handleAdvanceOffseasonStep}
+            onScoutProspect={handleScoutProspect}
+            onDraftPick={handleDraftPick}
+            onSign={handleSign}
+            onRelease={handleRelease}
+            onStartNewSeason={handleStartNewSeason}
           />
         )}
       </main>
